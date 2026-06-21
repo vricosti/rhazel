@@ -1,0 +1,14 @@
+[package]
+name = "rhazel"
+version = "0.1.0"
+edition = "2021"
+description = "Mini AArch64 code generator — Rust port of oaknut (NCE patcher subset)"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "rhazel"
+path = "src/lib.rs"
+
+[dev-dependencies]
+
+[workspace]
