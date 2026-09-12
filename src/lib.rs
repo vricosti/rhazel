@@ -8,10 +8,14 @@
 //! lives in rdynarmic's `backend/arm64`.
 
 pub mod block_of_code;
+pub mod code_generator;
 pub mod cond;
 pub mod inst;
 pub mod label;
+pub mod reg;
 
 pub use block_of_code::BlockOfCode;
+pub use code_generator::CodeGenerator;
 pub use cond::Cond;
 pub use label::Label;
+pub use reg::*;

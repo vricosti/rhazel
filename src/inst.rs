@@ -1093,6 +1093,13 @@ pub fn cinc_w(rd: u8, rn: u8, cond: impl Into<Cond>) -> u32 {
     0x1a80_0400 | (reg5(rn) << 16) | (cond4(cond.invert()) << 12) | (reg5(rn) << 5) | reg5(rd)
 }
 
+/// CINC Xd, Xn, cond (CSINC Xd, Xn, Xn, invert(cond)).
+pub fn cinc_x(rd: u8, rn: u8, cond: impl Into<Cond>) -> u32 {
+    let cond: Cond = cond.into();
+    // CINC is an alias of CSINC with the inverse condition.
+    0x9a80_0400 | (reg5(rn) << 16) | (cond4(cond.invert()) << 12) | (reg5(rn) << 5) | reg5(rd)
+}
+
 /// `bic wD, wN, wM`.
 pub fn bic_w(rd: u8, rn: u8, rm: u8) -> u32 {
     0x0a20_0000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
