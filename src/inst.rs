@@ -1032,6 +1032,19 @@ pub fn bfxil_w(rd: u8, rn: u8, lsb: u8, width: u8) -> u32 {
     0x3300_0000 | (immr << 16) | (imms << 10) | (reg5(rn) << 5) | reg5(rd)
 }
 
+/// `bfi wD, wN, #lsb, #width`.
+pub fn bfi_w(rd: u8, rn: u8, lsb: u8, width: u8) -> u32 {
+    assert!(width > 0, "AArch64 BFI width must be non-zero");
+    assert!(lsb < 32, "AArch64 BFI lsb out of range: {lsb}");
+    assert!(
+        (lsb as u16 + width as u16) <= 32,
+        "AArch64 BFI range out of bounds: lsb={lsb} width={width}"
+    );
+    let immr = ((32 - lsb as u32) & 0x1f) as u32;
+    let imms = width as u32 - 1;
+    0x3300_0000 | (immr << 16) | (imms << 10) | (reg5(rn) << 5) | reg5(rd)
+}
+
 /// `bfi xD, xN, #lsb, #width`.
 pub fn bfi_x(rd: u8, rn: u8, lsb: u8, width: u8) -> u32 {
     assert!(width > 0, "AArch64 BFI width must be non-zero");

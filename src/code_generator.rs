@@ -20,7 +20,7 @@ use crate::cond::Cond;
 use crate::inst;
 use crate::label::Label;
 use crate::reg::{
-    DReg, GpReg, QReg, VReg16B, VReg4S, VRegArranged, WReg, XReg,
+    DReg, GpReg, QReg, VReg16B, VReg4S, VRegArranged, WReg, XReg, XRegSp,
 };
 
 pub struct CodeGenerator<'a> {
@@ -107,6 +107,60 @@ impl<'a> CodeGenerator<'a> {
     /// `NOP()`
     pub fn nop(&mut self) -> Result<(), String> {
         self.emit(inst::nop())
+    }
+
+    /// `BLR(Xn)`
+    pub fn blr(&mut self, rn: XReg) -> Result<(), String> {
+        self.emit(inst::blr(rn.index()))
+    }
+
+    // --- Loads and stores (unsigned immediate offset) -----------------------
+
+    /// `STR(Rt, [Xn|SP, #imm])`
+    pub fn str<R: GpReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+        let rn = rn.into();
+        self.emit(if R::SF {
+            inst::str_x_unsigned(rt.index(), rn.index(), imm_bytes)
+        } else {
+            inst::str_w_unsigned(rt.index(), rn.index(), imm_bytes)
+        })
+    }
+
+    /// `LDR(Rt, [Xn|SP, #imm])`
+    pub fn ldr<R: GpReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+        let rn = rn.into();
+        self.emit(if R::SF {
+            inst::ldr_x_unsigned(rt.index(), rn.index(), imm_bytes)
+        } else {
+            inst::ldr_w_unsigned(rt.index(), rn.index(), imm_bytes)
+        })
+    }
+
+    /// `MOV(Rd, imm)` — oaknut's immediate-materializing overload.
+    ///
+    /// oaknut chooses the shortest MOVZ/MOVN/MOVK/ORR sequence. This port
+    /// keeps the sequence the emitters produced before they moved to the
+    /// generator: `MOVZ` of the low half-word, then a `MOVK` for every
+    /// non-zero higher half-word, so the emitted code is unchanged.
+    pub fn mov_imm<R: GpReg>(&mut self, rd: R, imm: u64) -> Result<(), String> {
+        self.movz(rd, (imm & 0xffff) as u16, 0)?;
+        let shifts: &[u8] = if R::SF { &[16, 32, 48] } else { &[16] };
+        for &shift in shifts {
+            let chunk = ((imm >> shift) & 0xffff) as u16;
+            if chunk != 0 {
+                self.movk(rd, chunk, shift)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `BFI(Rd, Rn, #lsb, #width)`
+    pub fn bfi<R: GpReg>(&mut self, rd: R, rn: R, lsb: u8, width: u8) -> Result<(), String> {
+        self.emit(if R::SF {
+            inst::bfi_x(rd.index(), rn.index(), lsb, width)
+        } else {
+            inst::bfi_w(rd.index(), rn.index(), lsb, width)
+        })
     }
 
     // --- Data processing ----------------------------------------------------
@@ -319,6 +373,36 @@ mod tests {
                 inst::sqadd_v(1, 2, 3, 8, false),
                 inst::sha256h_q(0, 1, 2),
                 inst::movi_d_imm0(9),
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_and_immediate_mnemonics_match_the_encoders() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        let mut code = CodeGenerator::new(&mut block);
+        code.str(WZR, X28, 0x40).unwrap();
+        code.ldr(X3, X16, 0).unwrap();
+        code.bfi(X3, X17, 32, 32).unwrap();
+        code.bfi(W3, W17, 8, 8).unwrap();
+        code.blr(X16).unwrap();
+        code.mov_imm(W5, 0x8000_0000).unwrap();
+        code.mov_imm(X6, 0x1234_0000_5678).unwrap();
+        code.mov_imm(X7, 0).unwrap();
+        drop(code);
+        assert_eq!(
+            words(&block),
+            vec![
+                inst::str_w_unsigned(31, 28, 0x40),
+                inst::ldr_x_unsigned(3, 16, 0),
+                inst::bfi_x(3, 17, 32, 32),
+                inst::bfi_w(3, 17, 8, 8),
+                inst::blr(16),
+                inst::movz_w(5, 0, 0),
+                inst::movk_w(5, 0x8000, 16),
+                inst::movz_x(6, 0x5678, 0),
+                inst::movk_x(6, 0x1234, 32),
+                inst::movz_x(7, 0, 0),
             ]
         );
     }
