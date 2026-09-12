@@ -23,7 +23,7 @@ use crate::reg::{
     DReg, FpReg, GpReg, GpRegSp, LdStKind, LdStReg, QReg, VReg16B, VReg2D, VReg4H, VReg4S,
     VReg8H, VRegArranged, VRegBytes, WReg, XReg, XRegSp,
 };
-use crate::system_reg::SystemReg;
+use crate::enums::{BarrierOp, SystemReg};
 
 pub struct CodeGenerator<'a> {
     code: &'a mut BlockOfCode,
@@ -104,6 +104,15 @@ macro_rules! vec_mnemonic3 {
             self.emit(inst::$enc(rd.index(), rn.index(), rm.index(), V::SIZE, V::Q))
         }
     };
+}
+
+/// Arithmetic immediates shift by 0 or 12 only.
+fn arith_imm_shift12(shift: u8) -> bool {
+    match shift {
+        0 => false,
+        12 => true,
+        _ => panic!("arithmetic immediate shift must be 0 or 12, got {shift}"),
+    }
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -289,6 +298,48 @@ impl<'a> CodeGenerator<'a> {
             inst::lsl_x_imm(rd.index(), rn.index(), shift)
         } else {
             inst::lsl_w_imm(rd.index(), rn.index(), shift)
+        })
+    }
+
+    /// `BRK(#imm16)`
+    pub fn brk(&mut self, imm16: u16) -> Result<(), String> {
+        self.emit(inst::brk(imm16))
+    }
+
+    /// `DSB(option)`
+    pub fn dsb(&mut self, option: BarrierOp) -> Result<(), String> {
+        self.emit(inst::dsb(option as u8))
+    }
+
+    /// `DMB(option)`
+    pub fn dmb(&mut self, option: BarrierOp) -> Result<(), String> {
+        self.emit(inst::dmb(option as u8))
+    }
+
+    /// `STRB(Wt, [Xn|SP, #imm])`
+    pub fn strb(&mut self, wt: WReg, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+        self.emit(inst::strb_w_unsigned(wt.index(), rn.into().index(), imm_bytes))
+    }
+
+    /// `ADD(Rd|SP, Rn|SP, #imm12, LSL #shift)` with `shift` 0 or 12.
+    pub fn add_imm_shift<R: GpRegSp>(&mut self, rd: impl Into<R>, rn: R, imm12: u32, shift: u8) -> Result<(), String> {
+        let rd = rd.into();
+        let shift12 = arith_imm_shift12(shift);
+        self.emit(if R::SF {
+            inst::add_x_imm_shift(rd.index(), rn.index(), imm12, shift12)
+        } else {
+            inst::add_w_imm_shift(rd.index(), rn.index(), imm12, shift12)
+        })
+    }
+
+    /// `SUB(Rd|SP, Rn|SP, #imm12, LSL #shift)` with `shift` 0 or 12.
+    pub fn sub_imm_shift<R: GpRegSp>(&mut self, rd: impl Into<R>, rn: R, imm12: u32, shift: u8) -> Result<(), String> {
+        let rd = rd.into();
+        let shift12 = arith_imm_shift12(shift);
+        self.emit(if R::SF {
+            inst::sub_x_imm_shift(rd.index(), rn.index(), imm12, shift12)
+        } else {
+            inst::sub_w_imm_shift(rd.index(), rn.index(), imm12, shift12)
         })
     }
 
@@ -969,6 +1020,12 @@ mod tests {
         code.and(W0, W0, W16).unwrap();
         code.orr(X0, X0, X1).unwrap();
         code.msr(SystemReg::NZCV, X16).unwrap();
+        code.brk(0).unwrap();
+        code.dsb(BarrierOp::SY).unwrap();
+        code.dmb(BarrierOp::ISH).unwrap();
+        code.strb(W16, SP, 0x30).unwrap();
+        code.sub_imm_shift(X26, X26, 1, 12).unwrap();
+        code.add_imm_shift(W1, W2, 3, 0).unwrap();
         drop(code);
         assert_eq!(
             words(&block),
@@ -990,6 +1047,12 @@ mod tests {
                 inst::and_w_reg(0, 0, 16),
                 inst::orr_x(0, 0, 1),
                 inst::msr_nzcv(16),
+                inst::brk(0),
+                inst::dsb_sy(),
+                inst::dmb(0b1011),
+                inst::strb_w_unsigned(16, 31, 0x30),
+                inst::sub_x_imm_shift(26, 26, 1, true),
+                inst::add_w_imm_shift(1, 2, 3, false),
             ]
         );
     }

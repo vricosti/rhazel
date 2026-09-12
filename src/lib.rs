@@ -12,12 +12,12 @@ pub mod code_generator;
 pub mod cond;
 pub mod inst;
 pub mod label;
+pub mod enums;
 pub mod reg;
-pub mod system_reg;
 
 pub use block_of_code::BlockOfCode;
 pub use code_generator::CodeGenerator;
 pub use cond::Cond;
 pub use label::Label;
+pub use enums::{BarrierOp, SystemReg};
 pub use reg::*;
-pub use system_reg::SystemReg;

@@ -3142,12 +3142,24 @@ pub fn dmb_ish() -> u32 {
 
 /// `dsb sy`.
 pub fn dsb_sy() -> u32 {
-    0xd503_3f9f
+    dsb(0b1111)
+}
+
+/// `dsb <option>`; `crm` is the barrier option field.
+pub fn dsb(crm: u8) -> u32 {
+    assert!(crm < 16, "barrier option out of range: {crm}");
+    0xd503_309f | (u32::from(crm) << 8)
+}
+
+/// `dmb <option>`; `crm` is the barrier option field.
+pub fn dmb(crm: u8) -> u32 {
+    assert!(crm < 16, "barrier option out of range: {crm}");
+    0xd503_30bf | (u32::from(crm) << 8)
 }
 
 /// `dmb sy`.
 pub fn dmb_sy() -> u32 {
-    0xd503_3fbf
+    dmb(0b1111)
 }
 
 /// `stp xT, xT2, [sp, #imm]!`.
@@ -3574,6 +3586,9 @@ mod tests {
         assert_eq!(ldp_w_offset(1, 2, 3, 8), 0x2941_0861);
         assert_eq!(stp_w_offset(1, 2, 3, 8), 0x2901_0861);
         assert_eq!(tst_w_imm(1, 1), 0x7200_003f);
+        assert_eq!(dsb_sy(), 0xd503_3f9f);
+        assert_eq!(dmb_sy(), 0xd503_3fbf);
+        assert_eq!(dmb(0b1011), 0xd503_3bbf);
         assert_eq!(ldr_h_unsigned(5, 6, 8), 0x7d40_10c5);
         assert_eq!(fmax_s(0, 1, 2), 0x1e22_4820);
         assert_eq!(fmax_d(3, 4, 5), 0x1e65_4883);
