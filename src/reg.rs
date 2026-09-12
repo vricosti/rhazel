@@ -39,6 +39,10 @@ pub trait VRegArranged: Copy {
     fn index(self) -> u8;
 }
 
+/// A byte-arranged vector register (`Vn.8B` or `Vn.16B`), the operand class
+/// of the logical/permute mnemonics oaknut declares only for those two.
+pub trait VRegBytes: VRegArranged {}
+
 macro_rules! register_type {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
@@ -198,6 +202,9 @@ arranged!(VReg2S, 32, false, s2);
 arranged!(VReg4S, 32, true, s4);
 arranged!(VReg1D, 64, false, d1);
 arranged!(VReg2D, 64, true, d2);
+
+impl VRegBytes for VReg8B {}
+impl VRegBytes for VReg16B {}
 
 impl VReg {
     pub const fn b(self) -> BReg {

@@ -2616,6 +2616,11 @@ pub fn bsl_v8b(rd: u8, rn: u8, rm: u8) -> u32 {
     0x2e60_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
 }
 
+/// `bsl vD.16b, vN.16b, vM.16b`.
+pub fn bsl_v16b(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x6e60_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
 /// `orr vD.16b, vN.16b, vM.16b`.
 pub fn orr_v16b(rd: u8, rn: u8, rm: u8) -> u32 {
     0x4ea0_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)

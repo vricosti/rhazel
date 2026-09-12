@@ -20,7 +20,7 @@ use crate::cond::Cond;
 use crate::inst;
 use crate::label::Label;
 use crate::reg::{
-    DReg, GpReg, QReg, VReg16B, VReg4S, VRegArranged, WReg, XReg, XRegSp,
+    DReg, FpReg, GpReg, QReg, VReg16B, VReg4S, VRegArranged, VRegBytes, WReg, XReg, XRegSp,
 };
 
 pub struct CodeGenerator<'a> {
@@ -323,6 +323,126 @@ impl<'a> CodeGenerator<'a> {
         self.emit(inst::movi_d_imm0(rd.index()))
     }
 
+    // Mnemonics oaknut overloads across general-purpose and SIMD operands
+    // (`ADD`, `SUB`, `AND`, `EOR`, …) keep the bare name for the GP form and
+    // take a `_v` suffix for the vector form; Rust has no overloading.
+
+    vec_mnemonic3!(/// `ADD(Vd.T, Vn.T, Vm.T)`
+        add_v, add_v);
+    vec_mnemonic3!(/// `SUB(Vd.T, Vn.T, Vm.T)`
+        sub_v, sub_v);
+    vec_mnemonic3!(/// `CMHI(Vd.T, Vn.T, Vm.T)`
+        cmhi, cmhi_v);
+    vec_mnemonic3!(/// `SHADD(Vd.T, Vn.T, Vm.T)`
+        shadd, shadd_v);
+    vec_mnemonic3!(/// `SHSUB(Vd.T, Vn.T, Vm.T)`
+        shsub, shsub_v);
+    vec_mnemonic3!(/// `UHADD(Vd.T, Vn.T, Vm.T)`
+        uhadd, uhadd_v);
+    vec_mnemonic3!(/// `UHSUB(Vd.T, Vn.T, Vm.T)`
+        uhsub, uhsub_v);
+    vec_mnemonic3!(/// `UABD(Vd.T, Vn.T, Vm.T)`
+        uabd, uabd_v);
+
+    /// `CMEQ(Vd.T, Vn.T, #0)`
+    pub fn cmeq_zero<V: VRegArranged>(&mut self, rd: V, rn: V) -> Result<(), String> {
+        self.emit(inst::cmeq_v_zero(rd.index(), rn.index(), V::SIZE, V::Q))
+    }
+
+    /// `CMGE(Vd.T, Vn.T, #0)`
+    pub fn cmge_zero<V: VRegArranged>(&mut self, rd: V, rn: V) -> Result<(), String> {
+        self.emit(inst::cmge_v_zero(rd.index(), rn.index(), V::SIZE, V::Q))
+    }
+
+    /// `SSHR(Vd.T, Vn.T, #shift)`
+    pub fn sshr<V: VRegArranged>(&mut self, rd: V, rn: V, shift: u8) -> Result<(), String> {
+        self.emit(inst::sshr_v(rd.index(), rn.index(), V::SIZE, shift, V::Q))
+    }
+
+    /// `USHR(Vd.T, Vn.T, #shift)`
+    pub fn ushr<V: VRegArranged>(&mut self, rd: V, rn: V, shift: u8) -> Result<(), String> {
+        self.emit(inst::ushr_v(rd.index(), rn.index(), V::SIZE, shift, V::Q))
+    }
+
+    // Widening and narrowing forms name both arrangements as the assembler
+    // syntax does (`SXTL Vd.4S, Vn.4H`); the source arrangement selects the
+    // encoding, as in oaknut's per-arrangement overloads.
+
+    /// `SXTL(Vd.Tw, Vn.Tn)`
+    pub fn sxtl<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+        self.emit(inst::sxtl_v(rd.index(), rn.index(), N::SIZE))
+    }
+
+    /// `UXTL(Vd.Tw, Vn.Tn)`
+    pub fn uxtl<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+        self.emit(inst::uxtl_v(rd.index(), rn.index(), N::SIZE))
+    }
+
+    /// `XTN(Vd.Tn, Vn.Tw)`
+    pub fn xtn<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+        self.emit(inst::xtn_v(rd.index(), rn.index(), N::SIZE))
+    }
+
+    /// `SHRN(Vd.Tn, Vn.Tw, #shift)`
+    pub fn shrn<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N, shift: u8) -> Result<(), String> {
+        self.emit(inst::shrn_v(rd.index(), rn.index(), N::SIZE, shift))
+    }
+
+    /// `UADDLV(Rd, Vn.T)` — scalar destination one size wider than the lanes.
+    pub fn uaddlv<F: FpReg, V: VRegArranged>(&mut self, rd: F, rn: V) -> Result<(), String> {
+        self.emit(inst::uaddlv_from_v(rd.index(), rn.index(), V::SIZE, V::Q))
+    }
+
+    /// `AND(Vd.8B|16B, Vn, Vm)`
+    pub fn and_v<V: VRegBytes>(&mut self, rd: V, rn: V, rm: V) -> Result<(), String> {
+        self.emit(if V::Q {
+            inst::and_v16b(rd.index(), rn.index(), rm.index())
+        } else {
+            inst::and_v8b(rd.index(), rn.index(), rm.index())
+        })
+    }
+
+    /// `EOR(Vd.8B|16B, Vn, Vm)`
+    pub fn eor_v<V: VRegBytes>(&mut self, rd: V, rn: V, rm: V) -> Result<(), String> {
+        self.emit(if V::Q {
+            inst::eor_v16b(rd.index(), rn.index(), rm.index())
+        } else {
+            inst::eor_v8b(rd.index(), rn.index(), rm.index())
+        })
+    }
+
+    /// `BSL(Vd.8B|16B, Vn, Vm)`
+    pub fn bsl<V: VRegBytes>(&mut self, rd: V, rn: V, rm: V) -> Result<(), String> {
+        self.emit(if V::Q {
+            inst::bsl_v16b(rd.index(), rn.index(), rm.index())
+        } else {
+            inst::bsl_v8b(rd.index(), rn.index(), rm.index())
+        })
+    }
+
+    /// `EXT(Vd.8B|16B, Vn, Vm, #index)`
+    pub fn ext<V: VRegBytes>(&mut self, rd: V, rn: V, rm: V, index: u8) -> Result<(), String> {
+        self.emit(inst::ext_v16b(rd.index(), rn.index(), rm.index(), index, V::Q))
+    }
+
+    /// `MOVI(Vd.8B|16B, #imm8)`
+    pub fn movi<V: VRegBytes>(&mut self, rd: V, imm: u8) -> Result<(), String> {
+        self.emit(if V::Q {
+            inst::movi_v16b_imm(rd.index(), imm)
+        } else {
+            inst::movi_v8b_imm(rd.index(), imm)
+        })
+    }
+
+    /// `FMOV(Sd, Sn)` / `FMOV(Dd, Dn)`
+    pub fn fmov<F: FpReg>(&mut self, rd: F, rn: F) -> Result<(), String> {
+        self.emit(match F::SIZE {
+            2 => inst::fmov_s(rd.index(), rn.index()),
+            3 => inst::fmov_d(rd.index(), rn.index()),
+            size => panic!("FMOV register-to-register has no encoding for FP size {size}"),
+        })
+    }
+
     vec_mnemonic3!(/// `SQADD(Vd.T, Vn.T, Vm.T)`
         sqadd, sqadd_v);
     vec_mnemonic3!(/// `SQSUB(Vd.T, Vn.T, Vm.T)`
@@ -403,6 +523,64 @@ mod tests {
                 inst::movz_x(6, 0x5678, 0),
                 inst::movk_x(6, 0x1234, 32),
                 inst::movz_x(7, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn packed_simd_mnemonics_match_the_encoders() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        let mut code = CodeGenerator::new(&mut block);
+        code.add_v(V1.h4(), V2.h4(), V3.h4()).unwrap();
+        code.sub_v(V1.s2(), V2.s2(), V3.s2()).unwrap();
+        code.cmhi(V1.b8(), V2.b8(), V3.b8()).unwrap();
+        code.uhadd(V1.h4(), V2.h4(), V3.h4()).unwrap();
+        code.uabd(V1.b8(), V2.b8(), V3.b8()).unwrap();
+        code.cmeq_zero(V4.h4(), V5.h4()).unwrap();
+        code.cmge_zero(V4.s2(), V5.s2()).unwrap();
+        code.sshr(V4.s2(), V5.s2(), 1).unwrap();
+        code.ushr(V4.s2(), V5.s2(), 1).unwrap();
+        code.sxtl(V0.s4(), V6.h4()).unwrap();
+        code.uxtl(V0.h8(), V6.b8()).unwrap();
+        code.xtn(V0.h4(), V0.s4()).unwrap();
+        code.shrn(V0.h4(), V0.s4(), 16).unwrap();
+        code.uaddlv(H7, V7.b8()).unwrap();
+        code.and_v(V1.b8(), V1.b8(), V2.b8()).unwrap();
+        code.eor_v(V1.b16(), V1.b16(), V2.b16()).unwrap();
+        code.bsl(V1.b8(), V2.b8(), V3.b8()).unwrap();
+        code.bsl(V1.b16(), V2.b16(), V3.b16()).unwrap();
+        code.ext(V1.b8(), V1.b8(), V1.b8(), 4).unwrap();
+        code.movi(V2.b8(), 0b1111_0000).unwrap();
+        code.movi(V2.b16(), 0xff).unwrap();
+        code.fmov(D1, D2).unwrap();
+        code.fmov(S1, S2).unwrap();
+        drop(code);
+        assert_eq!(
+            words(&block),
+            vec![
+                inst::add_v(1, 2, 3, 16, false),
+                inst::sub_v(1, 2, 3, 32, false),
+                inst::cmhi_v(1, 2, 3, 8, false),
+                inst::uhadd_v(1, 2, 3, 16, false),
+                inst::uabd_v(1, 2, 3, 8, false),
+                inst::cmeq_v_zero(4, 5, 16, false),
+                inst::cmge_v_zero(4, 5, 32, false),
+                inst::sshr_v(4, 5, 32, 1, false),
+                inst::ushr_v(4, 5, 32, 1, false),
+                inst::sxtl_v(0, 6, 16),
+                inst::uxtl_v(0, 6, 8),
+                inst::xtn_v(0, 0, 32),
+                inst::shrn_v(0, 0, 32, 16),
+                inst::uaddlv_from_v(7, 7, 8, false),
+                inst::and_v8b(1, 1, 2),
+                inst::eor_v16b(1, 1, 2),
+                inst::bsl_v8b(1, 2, 3),
+                inst::bsl_v16b(1, 2, 3),
+                inst::ext_v16b(1, 1, 1, 4, false),
+                inst::movi_v8b_imm(2, 0b1111_0000),
+                inst::movi_v16b_imm(2, 0xff),
+                inst::fmov_d(1, 2),
+                inst::fmov_s(1, 2),
             ]
         );
     }
