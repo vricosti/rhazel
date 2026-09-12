@@ -37,6 +37,28 @@ pub trait VRegArranged: Copy {
     /// `Q` bit: 128-bit arrangement.
     const Q: bool;
     fn index(self) -> u8;
+    /// The arrangement's `VRegSelector` accessor, for code generic over the
+    /// arrangement (upstream's `EmitThreeOpArranged<fsize>` pattern).
+    fn from_vreg(reg: VReg) -> Self;
+}
+
+/// The register classes `LDR`/`STR` accept; oaknut overloads them over every
+/// general-purpose and FP/SIMD width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LdStKind {
+    W,
+    X,
+    B,
+    H,
+    S,
+    D,
+    Q,
+}
+
+/// A register operand of a load or store.
+pub trait LdStReg: Copy {
+    const KIND: LdStKind;
+    fn index(self) -> u8;
 }
 
 /// A byte-arranged vector register (`Vn.8B` or `Vn.16B`), the operand class
@@ -130,6 +152,42 @@ impl GpRegSp for XRegSp {
     }
 }
 
+// oaknut's `XRegSp(XReg)` converting constructor is implicit, so an `XReg`
+// is accepted wherever an `SP`-capable operand is expected, with the same
+// hazard: register 31 encodes `SP` in that position, not `XZR`.
+impl GpRegSp for XReg {
+    const SF: bool = true;
+    fn index(self) -> u8 {
+        self.0
+    }
+}
+
+impl GpRegSp for WReg {
+    const SF: bool = false;
+    fn index(self) -> u8 {
+        self.0
+    }
+}
+
+macro_rules! ldst_reg {
+    ($name:ident, $kind:ident) => {
+        impl LdStReg for $name {
+            const KIND: LdStKind = LdStKind::$kind;
+            fn index(self) -> u8 {
+                self.0
+            }
+        }
+    };
+}
+
+ldst_reg!(WReg, W);
+ldst_reg!(XReg, X);
+ldst_reg!(BReg, B);
+ldst_reg!(HReg, H);
+ldst_reg!(SReg, S);
+ldst_reg!(DReg, D);
+ldst_reg!(QReg, Q);
+
 /// oaknut converts `XReg` to `XRegSp` implicitly; a register number that is
 /// not 31 means the same thing in both positions.
 impl From<XReg> for XRegSp {
@@ -182,6 +240,9 @@ macro_rules! arranged {
             const Q: bool = $q;
             fn index(self) -> u8 {
                 self.0
+            }
+            fn from_vreg(reg: VReg) -> Self {
+                $name(reg.0)
             }
         }
 
@@ -276,5 +337,6 @@ mod tests {
         assert_eq!(V5.s4().index(), 5);
         assert_eq!(V5.q().index(), 5);
         assert_eq!(<QReg as FpReg>::SIZE, 4);
+        assert_eq!(<VReg2D as VRegArranged>::from_vreg(V9), V9.d2());
     }
 }

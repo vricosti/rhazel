@@ -20,8 +20,10 @@ use crate::cond::Cond;
 use crate::inst;
 use crate::label::Label;
 use crate::reg::{
-    DReg, FpReg, GpReg, QReg, VReg16B, VReg4S, VRegArranged, VRegBytes, WReg, XReg, XRegSp,
+    DReg, FpReg, GpReg, GpRegSp, LdStKind, LdStReg, QReg, VReg16B, VReg2D, VReg4H, VReg4S,
+    VReg8H, VRegArranged, VRegBytes, WReg, XReg, XRegSp,
 };
+use crate::system_reg::SystemReg;
 
 pub struct CodeGenerator<'a> {
     code: &'a mut BlockOfCode,
@@ -48,6 +50,48 @@ macro_rules! gp_mnemonic3 {
                 inst::$x(rd.index(), rn.index(), rm.index())
             } else {
                 inst::$w(rd.index(), rn.index(), rm.index())
+            })
+        }
+    };
+}
+
+// FP vector mnemonics: the encoders exist per arrangement (`fadd_v4s`,
+// `fadd_v2d`), so the generic method dispatches on the arrangement's size
+// and `Q`; other arrangements have no encoder yet and are a caller bug.
+macro_rules! fp_vec_mnemonic3 {
+    ($(#[$doc:meta])* $name:ident, $v4s:ident, $v2d:ident) => {
+        $(#[$doc])*
+        pub fn $name<V: VRegArranged>(&mut self, rd: V, rn: V, rm: V) -> Result<(), String> {
+            self.emit(match (V::SIZE, V::Q) {
+                (32, true) => inst::$v4s(rd.index(), rn.index(), rm.index()),
+                (64, true) => inst::$v2d(rd.index(), rn.index(), rm.index()),
+                _ => panic!(concat!(stringify!($name), " has encoders only for the 4S and 2D arrangements")),
+            })
+        }
+    };
+}
+
+macro_rules! fp_vec_mnemonic2 {
+    ($(#[$doc:meta])* $name:ident, $v4s:ident, $v2d:ident) => {
+        $(#[$doc])*
+        pub fn $name<V: VRegArranged>(&mut self, rd: V, rn: V) -> Result<(), String> {
+            self.emit(match (V::SIZE, V::Q) {
+                (32, true) => inst::$v4s(rd.index(), rn.index()),
+                (64, true) => inst::$v2d(rd.index(), rn.index()),
+                _ => panic!(concat!(stringify!($name), " has encoders only for the 4S and 2D arrangements")),
+            })
+        }
+    };
+}
+
+macro_rules! fp_vec_mnemonic2_fbits {
+    ($(#[$doc:meta])* $name:ident, $v4s:ident, $v2d:ident) => {
+        $(#[$doc])*
+        pub fn $name<V: VRegArranged>(&mut self, rd: V, rn: V, fbits: u8) -> Result<(), String> {
+            self.emit(match (V::SIZE, V::Q) {
+                (32, true) => inst::$v4s(rd.index(), rn.index(), fbits),
+                (64, true) => inst::$v2d(rd.index(), rn.index(), fbits),
+                _ => panic!(concat!(stringify!($name), " has encoders only for the 4S and 2D arrangements")),
             })
         }
     };
@@ -116,23 +160,70 @@ impl<'a> CodeGenerator<'a> {
 
     // --- Loads and stores (unsigned immediate offset) -----------------------
 
-    /// `STR(Rt, [Xn|SP, #imm])`
-    pub fn str<R: GpReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
-        let rn = rn.into();
-        self.emit(if R::SF {
-            inst::str_x_unsigned(rt.index(), rn.index(), imm_bytes)
-        } else {
-            inst::str_w_unsigned(rt.index(), rn.index(), imm_bytes)
+    /// `STR(Rt, [Xn|SP, #imm])` for every GP and FP/SIMD register width.
+    pub fn str<R: LdStReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+        let (rt, rn) = (rt.index(), rn.into().index());
+        self.emit(match R::KIND {
+            LdStKind::W => inst::str_w_unsigned(rt, rn, imm_bytes),
+            LdStKind::X => inst::str_x_unsigned(rt, rn, imm_bytes),
+            LdStKind::B => inst::str_b_unsigned(rt, rn, imm_bytes),
+            LdStKind::H => inst::str_h_unsigned(rt, rn, imm_bytes),
+            LdStKind::S => inst::str_s_unsigned(rt, rn, imm_bytes),
+            LdStKind::D => inst::str_d_unsigned(rt, rn, imm_bytes),
+            LdStKind::Q => inst::str_q_unsigned(rt, rn, imm_bytes),
         })
     }
 
-    /// `LDR(Rt, [Xn|SP, #imm])`
-    pub fn ldr<R: GpReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
-        let rn = rn.into();
+    /// `LDR(Rt, [Xn|SP, #imm])` for every GP and FP/SIMD register width.
+    pub fn ldr<R: LdStReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+        let (rt, rn) = (rt.index(), rn.into().index());
+        self.emit(match R::KIND {
+            LdStKind::W => inst::ldr_w_unsigned(rt, rn, imm_bytes),
+            LdStKind::X => inst::ldr_x_unsigned(rt, rn, imm_bytes),
+            LdStKind::B => inst::ldr_b_unsigned(rt, rn, imm_bytes),
+            LdStKind::H => inst::ldr_h_unsigned(rt, rn, imm_bytes),
+            LdStKind::S => inst::ldr_s_unsigned(rt, rn, imm_bytes),
+            LdStKind::D => inst::ldr_d_unsigned(rt, rn, imm_bytes),
+            LdStKind::Q => inst::ldr_q_unsigned(rt, rn, imm_bytes),
+        })
+    }
+
+    /// `ADD(Rd|SP, Rn|SP, #imm)`; `rd` accepts the `SP`-capable type or the
+    /// plain register, as oaknut's implicit `XReg -> XRegSp` conversion does.
+    pub fn add_imm<R: GpRegSp>(&mut self, rd: impl Into<R>, rn: R, imm: u32) -> Result<(), String> {
+        let rd = rd.into();
         self.emit(if R::SF {
-            inst::ldr_x_unsigned(rt.index(), rn.index(), imm_bytes)
+            inst::add_x_imm(rd.index(), rn.index(), imm)
         } else {
-            inst::ldr_w_unsigned(rt.index(), rn.index(), imm_bytes)
+            inst::add_w_imm(rd.index(), rn.index(), imm)
+        })
+    }
+
+    /// `SUB(Rd|SP, Rn|SP, #imm)`
+    pub fn sub_imm<R: GpRegSp>(&mut self, rd: impl Into<R>, rn: R, imm: u32) -> Result<(), String> {
+        let rd = rd.into();
+        self.emit(if R::SF {
+            inst::sub_x_imm(rd.index(), rn.index(), imm)
+        } else {
+            inst::sub_w_imm(rd.index(), rn.index(), imm)
+        })
+    }
+
+    /// `MSR(SystemReg, Xt)`
+    pub fn msr(&mut self, sysreg: SystemReg, rt: XReg) -> Result<(), String> {
+        self.emit(match sysreg {
+            SystemReg::FPCR => inst::msr_fpcr(rt.index()),
+            SystemReg::FPSR => inst::msr_fpsr(rt.index()),
+            SystemReg::NZCV => inst::msr_nzcv(rt.index()),
+        })
+    }
+
+    /// `MRS(Xt, SystemReg)`
+    pub fn mrs(&mut self, rt: XReg, sysreg: SystemReg) -> Result<(), String> {
+        self.emit(match sysreg {
+            SystemReg::FPCR => inst::mrs_fpcr(rt.index()),
+            SystemReg::FPSR => inst::mrs_fpsr(rt.index()),
+            SystemReg::NZCV => inst::mrs_nzcv(rt.index()),
         })
     }
 
@@ -443,6 +534,119 @@ impl<'a> CodeGenerator<'a> {
         })
     }
 
+    vec_mnemonic3!(/// `ZIP1(Vd.T, Vn.T, Vm.T)`
+        zip1, zip1_v);
+
+    /// `BIC(Vd.8H, #imm8, LSL #shift)` (vector, immediate)
+    pub fn bic_imm(&mut self, rd: VReg8H, imm8: u8, lsl: u8) -> Result<(), String> {
+        self.emit(inst::bic_v8h_imm(rd.index(), imm8, lsl))
+    }
+
+    fp_vec_mnemonic3!(/// `FADD(Vd.T, Vn.T, Vm.T)`
+        fadd, fadd_v4s, fadd_v2d);
+    fp_vec_mnemonic3!(/// `FSUB(Vd.T, Vn.T, Vm.T)`
+        fsub, fsub_v4s, fsub_v2d);
+    fp_vec_mnemonic3!(/// `FMUL(Vd.T, Vn.T, Vm.T)`
+        fmul, fmul_v4s, fmul_v2d);
+    fp_vec_mnemonic3!(/// `FMULX(Vd.T, Vn.T, Vm.T)`
+        fmulx, fmulx_v4s, fmulx_v2d);
+    fp_vec_mnemonic3!(/// `FDIV(Vd.T, Vn.T, Vm.T)`
+        fdiv, fdiv_v4s, fdiv_v2d);
+    fp_vec_mnemonic3!(/// `FMAX(Vd.T, Vn.T, Vm.T)`
+        fmax, fmax_v4s, fmax_v2d);
+    fp_vec_mnemonic3!(/// `FMAXNM(Vd.T, Vn.T, Vm.T)`
+        fmaxnm, fmaxnm_v4s, fmaxnm_v2d);
+    fp_vec_mnemonic3!(/// `FMIN(Vd.T, Vn.T, Vm.T)`
+        fmin, fmin_v4s, fmin_v2d);
+    fp_vec_mnemonic3!(/// `FMINNM(Vd.T, Vn.T, Vm.T)`
+        fminnm, fminnm_v4s, fminnm_v2d);
+    fp_vec_mnemonic3!(/// `FCMEQ(Vd.T, Vn.T, Vm.T)`
+        fcmeq, fcmeq_v4s, fcmeq_v2d);
+    fp_vec_mnemonic3!(/// `FCMGT(Vd.T, Vn.T, Vm.T)`
+        fcmgt, fcmgt_v4s, fcmgt_v2d);
+    fp_vec_mnemonic3!(/// `FCMGE(Vd.T, Vn.T, Vm.T)`
+        fcmge, fcmge_v4s, fcmge_v2d);
+    fp_vec_mnemonic3!(/// `FMLA(Vd.T, Vn.T, Vm.T)`
+        fmla, fmla_v4s, fmla_v2d);
+    fp_vec_mnemonic3!(/// `FADDP(Vd.T, Vn.T, Vm.T)`
+        faddp, faddp_v4s, faddp_v2d);
+    fp_vec_mnemonic3!(/// `FRECPS(Vd.T, Vn.T, Vm.T)`
+        frecps, frecps_v4s, frecps_v2d);
+    fp_vec_mnemonic3!(/// `FRSQRTS(Vd.T, Vn.T, Vm.T)`
+        frsqrts, frsqrts_v4s, frsqrts_v2d);
+
+    fp_vec_mnemonic2!(/// `FABS(Vd.T, Vn.T)`
+        fabs, fabs_v4s, fabs_v2d);
+    fp_vec_mnemonic2!(/// `FNEG(Vd.T, Vn.T)`
+        fneg, fneg_v4s, fneg_v2d);
+    fp_vec_mnemonic2!(/// `FSQRT(Vd.T, Vn.T)`
+        fsqrt, fsqrt_v4s, fsqrt_v2d);
+    fp_vec_mnemonic2!(/// `FRECPE(Vd.T, Vn.T)`
+        frecpe, frecpe_v4s, frecpe_v2d);
+    fp_vec_mnemonic2!(/// `FRSQRTE(Vd.T, Vn.T)`
+        frsqrte, frsqrte_v4s, frsqrte_v2d);
+    fp_vec_mnemonic2!(/// `FRINTN(Vd.T, Vn.T)`
+        frintn, frintn_v4s, frintn_v2d);
+    fp_vec_mnemonic2!(/// `FRINTP(Vd.T, Vn.T)`
+        frintp, frintp_v4s, frintp_v2d);
+    fp_vec_mnemonic2!(/// `FRINTM(Vd.T, Vn.T)`
+        frintm, frintm_v4s, frintm_v2d);
+    fp_vec_mnemonic2!(/// `FRINTZ(Vd.T, Vn.T)`
+        frintz, frintz_v4s, frintz_v2d);
+    fp_vec_mnemonic2!(/// `FRINTA(Vd.T, Vn.T)`
+        frinta, frinta_v4s, frinta_v2d);
+    fp_vec_mnemonic2!(/// `FRINTX(Vd.T, Vn.T)`
+        frintx, frintx_v4s, frintx_v2d);
+    fp_vec_mnemonic2!(/// `SCVTF(Vd.T, Vn.T)`
+        scvtf, scvtf_v4s, scvtf_v2d);
+    fp_vec_mnemonic2!(/// `UCVTF(Vd.T, Vn.T)`
+        ucvtf, ucvtf_v4s, ucvtf_v2d);
+    fp_vec_mnemonic2!(/// `FCVTZS(Vd.T, Vn.T)`
+        fcvtzs, fcvtzs_v4s, fcvtzs_v2d);
+    fp_vec_mnemonic2!(/// `FCVTZU(Vd.T, Vn.T)`
+        fcvtzu, fcvtzu_v4s, fcvtzu_v2d);
+    fp_vec_mnemonic2!(/// `FCVTNS(Vd.T, Vn.T)`
+        fcvtns, fcvtns_v4s, fcvtns_v2d);
+    fp_vec_mnemonic2!(/// `FCVTPS(Vd.T, Vn.T)`
+        fcvtps, fcvtps_v4s, fcvtps_v2d);
+    fp_vec_mnemonic2!(/// `FCVTMS(Vd.T, Vn.T)`
+        fcvtms, fcvtms_v4s, fcvtms_v2d);
+    fp_vec_mnemonic2!(/// `FCVTAS(Vd.T, Vn.T)`
+        fcvtas, fcvtas_v4s, fcvtas_v2d);
+    fp_vec_mnemonic2!(/// `FCVTNU(Vd.T, Vn.T)`
+        fcvtnu, fcvtnu_v4s, fcvtnu_v2d);
+    fp_vec_mnemonic2!(/// `FCVTPU(Vd.T, Vn.T)`
+        fcvtpu, fcvtpu_v4s, fcvtpu_v2d);
+    fp_vec_mnemonic2!(/// `FCVTMU(Vd.T, Vn.T)`
+        fcvtmu, fcvtmu_v4s, fcvtmu_v2d);
+    fp_vec_mnemonic2!(/// `FCVTAU(Vd.T, Vn.T)`
+        fcvtau, fcvtau_v4s, fcvtau_v2d);
+
+    // oaknut overloads the fixed-point forms on arity (`SCVTF(Vd, Vn, #fbits)`).
+    fp_vec_mnemonic2_fbits!(/// `SCVTF(Vd.T, Vn.T, #fbits)`
+        scvtf_fixed, scvtf_v4s_fixed, scvtf_v2d_fixed);
+    fp_vec_mnemonic2_fbits!(/// `UCVTF(Vd.T, Vn.T, #fbits)`
+        ucvtf_fixed, ucvtf_v4s_fixed, ucvtf_v2d_fixed);
+    fp_vec_mnemonic2_fbits!(/// `FCVTZS(Vd.T, Vn.T, #fbits)`
+        fcvtzs_fixed, fcvtzs_v4s_fixed, fcvtzs_v2d_fixed);
+    fp_vec_mnemonic2_fbits!(/// `FCVTZU(Vd.T, Vn.T, #fbits)`
+        fcvtzu_fixed, fcvtzu_v4s_fixed, fcvtzu_v2d_fixed);
+
+    /// `FCVTL(Vd.4S, Vn.4H)`
+    pub fn fcvtl(&mut self, rd: VReg4S, rn: VReg4H) -> Result<(), String> {
+        self.emit(inst::fcvtl_v4s_from_v4h(rd.index(), rn.index()))
+    }
+
+    /// `FCVTN(Vd.4H, Vn.4S)`
+    pub fn fcvtn(&mut self, rd: VReg4H, rn: VReg4S) -> Result<(), String> {
+        self.emit(inst::fcvtn_v4h_from_v4s(rd.index(), rn.index()))
+    }
+
+    /// `FADDP(Dd, Vn.2D)` — the scalar pairwise form.
+    pub fn faddp_scalar(&mut self, rd: DReg, rn: VReg2D) -> Result<(), String> {
+        self.emit(inst::faddp_d_from_v2d(rd.index(), rn.index()))
+    }
+
     vec_mnemonic3!(/// `SQADD(Vd.T, Vn.T, Vm.T)`
         sqadd, sqadd_v);
     vec_mnemonic3!(/// `SQSUB(Vd.T, Vn.T, Vm.T)`
@@ -581,6 +785,58 @@ mod tests {
                 inst::movi_v16b_imm(2, 0xff),
                 inst::fmov_d(1, 2),
                 inst::fmov_s(1, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn fp_vector_mnemonics_match_the_encoders() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        let mut code = CodeGenerator::new(&mut block);
+        code.fadd(V1.s4(), V2.s4(), V3.s4()).unwrap();
+        code.fmla(V1.d2(), V2.d2(), V3.d2()).unwrap();
+        code.frintx(V4.s4(), V5.s4()).unwrap();
+        code.fcvtau(V4.d2(), V5.d2()).unwrap();
+        code.scvtf_fixed(V4.s4(), V5.s4(), 7).unwrap();
+        code.fcvtzu_fixed(V4.d2(), V5.d2(), 9).unwrap();
+        code.fcvtl(V6.s4(), V7.h4()).unwrap();
+        code.fcvtn(V6.h4(), V7.s4()).unwrap();
+        code.faddp_scalar(D6, V7.d2()).unwrap();
+        code.zip1(V0.d2(), V1.d2(), V2.d2()).unwrap();
+        code.bic_imm(V8.h8(), 0b1000_0000, 8).unwrap();
+        code.msr(SystemReg::FPCR, X16).unwrap();
+        code.mrs(X17, SystemReg::FPSR).unwrap();
+        code.add_imm(X0, SP, 16).unwrap();
+        code.add_imm(X3, X28, 0x40).unwrap();
+        code.sub_imm(W1, W2, 4).unwrap();
+        code.str(Q1, X1, 0).unwrap();
+        code.ldr(Q2, SP, 16).unwrap();
+        code.str(D3, X4, 8).unwrap();
+        code.ldr(B5, X6, 1).unwrap();
+        drop(code);
+        assert_eq!(
+            words(&block),
+            vec![
+                inst::fadd_v4s(1, 2, 3),
+                inst::fmla_v2d(1, 2, 3),
+                inst::frintx_v4s(4, 5),
+                inst::fcvtau_v2d(4, 5),
+                inst::scvtf_v4s_fixed(4, 5, 7),
+                inst::fcvtzu_v2d_fixed(4, 5, 9),
+                inst::fcvtl_v4s_from_v4h(6, 7),
+                inst::fcvtn_v4h_from_v4s(6, 7),
+                inst::faddp_d_from_v2d(6, 7),
+                inst::zip1_v(0, 1, 2, 64, true),
+                inst::bic_v8h_sign_bit(8),
+                inst::msr_fpcr(16),
+                inst::mrs_fpsr(17),
+                inst::add_x_imm(0, 31, 16),
+                inst::add_x_imm(3, 28, 0x40),
+                inst::sub_w_imm(1, 2, 4),
+                inst::str_q_unsigned(1, 1, 0),
+                inst::ldr_q_unsigned(2, 31, 16),
+                inst::str_d_unsigned(3, 4, 8),
+                inst::ldr_b_unsigned(5, 6, 1),
             ]
         );
     }

@@ -1203,6 +1203,26 @@ pub fn stur_x(rt: u8, rn: u8, imm_bytes: i32) -> u32 {
     0xf800_0000 | (imm9_unscaled(imm_bytes) << 12) | (reg5(rn) << 5) | reg5(rt)
 }
 
+/// `str bT, [xN, #imm]`.
+pub fn str_b_unsigned(rt: u8, rn: u8, imm_bytes: u32) -> u32 {
+    0x3d00_0000 | (imm12_scaled(imm_bytes, 1) << 10) | (reg5(rn) << 5) | reg5(rt)
+}
+
+/// `ldr bT, [xN, #imm]`.
+pub fn ldr_b_unsigned(rt: u8, rn: u8, imm_bytes: u32) -> u32 {
+    0x3d40_0000 | (imm12_scaled(imm_bytes, 1) << 10) | (reg5(rn) << 5) | reg5(rt)
+}
+
+/// `str hT, [xN, #imm]`.
+pub fn str_h_unsigned(rt: u8, rn: u8, imm_bytes: u32) -> u32 {
+    0x7d00_0000 | (imm12_scaled(imm_bytes, 2) << 10) | (reg5(rn) << 5) | reg5(rt)
+}
+
+/// `ldr hT, [xN, #imm]`.
+pub fn ldr_h_unsigned(rt: u8, rn: u8, imm_bytes: u32) -> u32 {
+    0x7d40_0000 | (imm12_scaled(imm_bytes, 2) << 10) | (reg5(rn) << 5) | reg5(rt)
+}
+
 /// `str sT, [xN, #imm]`.
 pub fn str_s_unsigned(rt: u8, rn: u8, imm_bytes: u32) -> u32 {
     0xbd00_0000 | (imm12_scaled(imm_bytes, 4) << 10) | (reg5(rn) << 5) | reg5(rt)
@@ -1448,9 +1468,23 @@ pub fn fabs_v2d(rd: u8, rn: u8) -> u32 {
     0x4ee0_f800 | (reg5(rn) << 5) | reg5(rd)
 }
 
+/// `bic vD.8h, #imm8, lsl #0|8` (vector, immediate).
+pub fn bic_v8h_imm(rd: u8, imm8: u8, lsl: u8) -> u32 {
+    let cmode = match lsl {
+        0 => 0b1001,
+        8 => 0b1011,
+        _ => panic!("BIC Vd.8H immediate shift must be 0 or 8, got {lsl}"),
+    };
+    0x6f00_0400
+        | ((u32::from(imm8) >> 5) << 16)
+        | (cmode << 12)
+        | ((u32::from(imm8) & 0x1f) << 5)
+        | reg5(rd)
+}
+
 /// `bic vD.8h, #0x80, lsl #8`.
 pub fn bic_v8h_sign_bit(rd: u8) -> u32 {
-    0x6f04_b400 | reg5(rd)
+    bic_v8h_imm(rd, 0x80, 8)
 }
 
 /// `frintn sD, sN`.
@@ -3528,6 +3562,10 @@ mod tests {
         assert_eq!(fabs_v4s(0, 1), 0x4ea0_f820);
         assert_eq!(fabs_v2d(2, 3), 0x4ee0_f862);
         assert_eq!(bic_v8h_sign_bit(4), 0x6f04_b404);
+        assert_eq!(bic_v8h_imm(4, 0x80, 8), 0x6f04_b404);
+        assert_eq!(bic_v8h_imm(4, 0x80, 0), 0x6f04_9404);
+        assert_eq!(str_b_unsigned(1, 2, 3), 0x3d00_0c41);
+        assert_eq!(ldr_h_unsigned(5, 6, 8), 0x7d40_10c5);
         assert_eq!(fmax_s(0, 1, 2), 0x1e22_4820);
         assert_eq!(fmax_d(3, 4, 5), 0x1e65_4883);
         assert_eq!(fmin_s(6, 7, 8), 0x1e28_58e6);
