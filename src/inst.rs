@@ -623,6 +623,11 @@ pub fn ldaxr_w(rt: u8, rn: u8) -> u32 {
     0x885f_fc00 | (reg5(rn) << 5) | reg5(rt)
 }
 
+/// `ldaxr xT, [xN|sp]`.
+pub fn ldaxr_x(rt: u8, rn: u8) -> u32 {
+    ldaxr_w(rt, rn) | 0x4000_0000
+}
+
 /// `stlrb wT, [xN]`.
 pub fn stlrb_w(rt: u8, rn: u8) -> u32 {
     0x089f_fc00 | (reg5(rn) << 5) | reg5(rt)
@@ -646,6 +651,11 @@ pub fn stlr_x(rt: u8, rn: u8) -> u32 {
 /// `stlxr wS, wT, [xN]`.
 pub fn stlxr_w(rs: u8, rt: u8, rn: u8) -> u32 {
     0x8800_fc00 | (reg5(rs) << 16) | (reg5(rn) << 5) | reg5(rt)
+}
+
+/// `stlxr wS, xT, [xN|sp]`.
+pub fn stlxr_x(rs: u8, rt: u8, rn: u8) -> u32 {
+    stlxr_w(rs, rt, rn) | 0x4000_0000
 }
 
 /// `stp wT1, wT2, [xN, #imm]`.
@@ -2254,7 +2264,12 @@ pub fn mov_v16b(rd: u8, rn: u8) -> u32 {
 
 /// `movi dD, #0`.
 pub fn movi_d_imm0(rd: u8) -> u32 {
-    0x2f00_e400 | reg5(rd)
+    movi_d_rep_imm(rd, 0)
+}
+
+/// `movi dD, #imm`: each encoded bit expands to an FF/00 byte (Oaknut `RepImm`).
+pub fn movi_d_rep_imm(rd: u8, encoded: u8) -> u32 {
+    0x2f00_e400 | (((encoded as u32 >> 5) & 7) << 16) | (((encoded as u32) & 31) << 5) | reg5(rd)
 }
 
 /// `aese vD.16b, vN.16b`.
@@ -2639,6 +2654,11 @@ pub fn and_v8b(rd: u8, rn: u8, rm: u8) -> u32 {
 /// `bic vD.16b, vN.16b, vM.16b`.
 pub fn bic_v16b(rd: u8, rn: u8, rm: u8) -> u32 {
     0x4e60_1c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `bic vD.8b, vN.8b, vM.8b`.
+pub fn bic_v8b(rd: u8, rn: u8, rm: u8) -> u32 {
+    bic_v16b(rd, rn, rm) & !0x4000_0000
 }
 
 /// `eor vD.16b, vN.16b, vM.16b`.
@@ -3209,12 +3229,20 @@ pub fn ldp_q_offset_sp(rt: u8, rt2: u8, imm_bytes: i32) -> u32 {
 
 /// `stp qT, qT2, [xN|sp, #imm]`.
 pub fn stp_q_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> u32 {
-    0xad00_0000 | (imm7_scaled(imm_bytes, 16) << 15) | (reg5(rt2) << 10) | (reg5(rn) << 5) | reg5(rt)
+    0xad00_0000
+        | (imm7_scaled(imm_bytes, 16) << 15)
+        | (reg5(rt2) << 10)
+        | (reg5(rn) << 5)
+        | reg5(rt)
 }
 
 /// `ldp qT, qT2, [xN|sp, #imm]`.
 pub fn ldp_q_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> u32 {
-    0xad40_0000 | (imm7_scaled(imm_bytes, 16) << 15) | (reg5(rt2) << 10) | (reg5(rn) << 5) | reg5(rt)
+    0xad40_0000
+        | (imm7_scaled(imm_bytes, 16) << 15)
+        | (reg5(rt2) << 10)
+        | (reg5(rn) << 5)
+        | reg5(rt)
 }
 
 /// `stp x29, x30, [sp, #-16]!`.
