@@ -1,72 +1,224 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
-
-//! Label and fixup mechanism — mirrors oaknut::Label.
+//! Minimal AArch64 label support for backend-local branch patching.
 //!
-//! A Label is a forward/backward reference to a code offset.
-//! When a branch is emitted before the label is bound, a fixup entry is
-//! recorded.  When `bind` is called the fixup list is resolved.
+//! Upstream uses Oaknut labels. This keeps the same ownership model without
+//! exposing a scheduler or dispatcher abstraction through the emitter.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::block_of_code::BlockOfCode;
+use crate::inst;
+use crate::cond::Cond;
 
-#[derive(Debug, Default)]
-struct LabelInner {
-    /// Byte offset from the start of the code buffer, or None if not yet bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingBranch {
+    Uncond { offset: usize },
+    Cond { offset: usize, cond: Cond },
+    CbzX { offset: usize, rt: u8 },
+    CbnzX { offset: usize, rt: u8 },
+}
+
+#[derive(Default, Debug)]
+pub struct Label {
     offset: Option<usize>,
-    /// List of (fixup_byte_offset, fixup_kind) waiting for this label to be bound.
-    fixups: Vec<(usize, FixupKind)>,
+    pending: Vec<PendingBranch>,
 }
-
-/// Kind of fixup to apply when the label is resolved.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum FixupKind {
-    /// 26-bit PC-relative branch offset in bits [25:0], scaled by 4 (B / BL).
-    Branch26,
-    /// 19-bit PC-relative offset in bits [23:5], scaled by 4 (CBZ/CBNZ/LDR literal).
-    Imm19At5,
-    /// Raw 64-bit little-endian constant (for `dx`). Reserved for future use.
-    #[allow(dead_code)]
-    Data64,
-}
-
-/// A code label — cheap to clone (backed by `Rc<RefCell<>>`).
-#[derive(Clone, Debug, Default)]
-pub struct Label(Rc<RefCell<LabelInner>>);
 
 impl Label {
     pub fn new() -> Self {
-        Label(Rc::new(RefCell::new(LabelInner::default())))
+        Self::default()
     }
 
-    /// Returns the bound offset, or None if not yet bound.
-    pub fn offset(&self) -> Option<usize> {
-        self.0.borrow().offset
-    }
-
-    /// Bind the label to `offset` and return the pending fixups.
-    pub(crate) fn bind(&self, offset: usize) -> Vec<(usize, FixupKind)> {
-        let mut inner = self.0.borrow_mut();
-        assert!(inner.offset.is_none(), "label bound twice");
-        inner.offset = Some(offset);
-        std::mem::take(&mut inner.fixups)
-    }
-
-    /// Record a pending fixup at `at_offset` of the given kind.
-    pub(crate) fn add_fixup(&self, at_offset: usize, kind: FixupKind) {
-        let mut inner = self.0.borrow_mut();
-        if let Some(bound) = inner.offset {
-            // Label already bound — caller must apply immediately.
-            // We store it anyway so the caller can drain it right after.
-            inner.fixups.push((at_offset, kind));
-            let _ = bound;
-        } else {
-            inner.fixups.push((at_offset, kind));
+    pub fn bind(&mut self, code: &mut BlockOfCode) -> Result<(), String> {
+        let target_offset = code.code_size();
+        if self.offset.replace(target_offset).is_some() {
+            return Err("ARM64 label bound more than once".to_string());
         }
+
+        for branch in self.pending.drain(..) {
+            match branch {
+                PendingBranch::Uncond { offset } => {
+                    let pc_offset = branch_pc_offset_isize(offset, target_offset)?;
+                    code.patch_u32(offset, inst::b_imm(pc_offset))?;
+                }
+                PendingBranch::Cond { offset, cond } => {
+                    let pc_offset = branch_pc_offset(offset, target_offset)?;
+                    code.patch_u32(offset, inst::b_cond(cond, pc_offset))?;
+                }
+                PendingBranch::CbzX { offset, rt } => {
+                    let pc_offset = branch_pc_offset(offset, target_offset)?;
+                    code.patch_u32(offset, inst::cbz_x(rt, pc_offset))?;
+                }
+                PendingBranch::CbnzX { offset, rt } => {
+                    let pc_offset = branch_pc_offset(offset, target_offset)?;
+                    code.patch_u32(offset, inst::cbnz_x(rt, pc_offset))?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// True if already bound.
-    pub fn is_bound(&self) -> bool {
-        self.0.borrow().offset.is_some()
+    pub fn b(&mut self, code: &mut BlockOfCode) -> Result<usize, String> {
+        let offset = code.write_u32(inst::b_imm(0))?;
+        if let Some(target_offset) = self.offset {
+            let pc_offset = branch_pc_offset_isize(offset, target_offset)?;
+            code.patch_u32(offset, inst::b_imm(pc_offset))?;
+        } else {
+            self.pending.push(PendingBranch::Uncond { offset });
+        }
+        Ok(offset)
+    }
+
+    pub fn b_cond(&mut self, code: &mut BlockOfCode, cond: impl Into<Cond>) -> Result<usize, String> {
+        let cond: Cond = cond.into();
+        let offset = code.write_u32(inst::b_cond(cond, 0))?;
+        if let Some(target_offset) = self.offset {
+            let pc_offset = branch_pc_offset(offset, target_offset)?;
+            code.patch_u32(offset, inst::b_cond(cond, pc_offset))?;
+        } else {
+            self.pending.push(PendingBranch::Cond { offset, cond });
+        }
+        Ok(offset)
+    }
+
+    pub fn cbz_x(&mut self, code: &mut BlockOfCode, rt: u8) -> Result<usize, String> {
+        let offset = code.write_u32(inst::cbz_x(rt, 0))?;
+        if let Some(target_offset) = self.offset {
+            let pc_offset = branch_pc_offset(offset, target_offset)?;
+            code.patch_u32(offset, inst::cbz_x(rt, pc_offset))?;
+        } else {
+            self.pending.push(PendingBranch::CbzX { offset, rt });
+        }
+        Ok(offset)
+    }
+
+    pub fn cbnz_x(&mut self, code: &mut BlockOfCode, rt: u8) -> Result<usize, String> {
+        let offset = code.write_u32(inst::cbnz_x(rt, 0))?;
+        if let Some(target_offset) = self.offset {
+            let pc_offset = branch_pc_offset(offset, target_offset)?;
+            code.patch_u32(offset, inst::cbnz_x(rt, pc_offset))?;
+        } else {
+            self.pending.push(PendingBranch::CbnzX { offset, rt });
+        }
+        Ok(offset)
+    }
+
+    /// `tbnz xT, #bit, label` (oaknut `TBNZ(XReg, imm, Label&)`).
+    ///
+    /// TBNZ only encodes a ±32 KiB imm14. Memory fallbacks are deferred to the
+    /// end of the IR block, which can be farther than that (MK8D A32 write
+    /// path: 37564 bytes). Forward TBNZ is therefore always inverted to
+    /// `TBZ + B` so the long branch uses imm26.
+    pub fn tbnz_x(&mut self, code: &mut BlockOfCode, rt: u8, bit: u8) -> Result<usize, String> {
+        if let Some(target_offset) = self.offset {
+            let here = code.code_size();
+            let pc_offset = branch_pc_offset(here, target_offset)?;
+            if inst::tbnz_offset_in_range(pc_offset) {
+                return code.write_u32(inst::tbnz_x(rt, bit, pc_offset));
+            }
+        }
+        code.write_u32(inst::tbz_x(rt, bit, 8))?;
+        self.b(code)
+    }
+}
+
+fn branch_pc_offset(branch_offset: usize, target_offset: usize) -> Result<i32, String> {
+    i32::try_from(target_offset as isize - branch_offset as isize)
+        .map_err(|_| "ARM64 label branch offset overflow".to_string())
+}
+
+fn branch_pc_offset_isize(branch_offset: usize, target_offset: usize) -> Result<isize, String> {
+    Ok(branch_pc_offset(branch_offset, target_offset)? as isize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn emitted_words(code: &BlockOfCode) -> Vec<u32> {
+        (0..code.code_size() / 4)
+            .map(|index| unsafe {
+                code.code_base_ptr()
+                    .add(index * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forward_conditional_branch_is_patched_on_bind() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut label = Label::new();
+
+        label.b_cond(&mut code, Cond::EQ).unwrap();
+        code.write_u32(inst::nop()).unwrap();
+        label.bind(&mut code).unwrap();
+
+        assert_eq!(
+            emitted_words(&code),
+            vec![inst::b_cond(Cond::EQ, 8), inst::nop()]
+        );
+    }
+
+    #[test]
+    fn already_bound_label_patches_branch_immediately() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut label = Label::new();
+
+        label.bind(&mut code).unwrap();
+        label.b_cond(&mut code, Cond::EQ).unwrap();
+
+        assert_eq!(emitted_words(&code), vec![inst::b_cond(Cond::EQ, 0)]);
+    }
+
+    #[test]
+    fn forward_unconditional_and_cbz_branches_are_patched_on_bind() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut label = Label::new();
+
+        label.b(&mut code).unwrap();
+        label.cbz_x(&mut code, 16).unwrap();
+        label.cbnz_x(&mut code, 17).unwrap();
+        code.write_u32(inst::nop()).unwrap();
+        label.bind(&mut code).unwrap();
+
+        assert_eq!(
+            emitted_words(&code),
+            vec![
+                inst::b_imm(16),
+                inst::cbz_x(16, 12),
+                inst::cbnz_x(17, 8),
+                inst::nop()
+            ]
+        );
+    }
+
+    #[test]
+    fn forward_tbnz_uses_tbz_skip_and_long_branch() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut label = Label::new();
+
+        label.tbnz_x(&mut code, 0, 0).unwrap();
+        for _ in 0..8 {
+            code.write_u32(inst::nop()).unwrap();
+        }
+        label.bind(&mut code).unwrap();
+
+        let words = emitted_words(&code);
+        assert_eq!(words[0], inst::tbz_x(0, 0, 8));
+        assert_eq!(words[1], inst::b_imm(36));
+        assert_eq!(words.len(), 10);
+    }
+
+    #[test]
+    fn far_forward_tbnz_stays_in_imm26_range() {
+        let mut code = BlockOfCode::with_size(64 * 1024).unwrap();
+        let mut label = Label::new();
+        label.tbnz_x(&mut code, 16, 5).unwrap();
+        for _ in 0..10_000 {
+            code.write_u32(inst::nop()).unwrap();
+        }
+        label.bind(&mut code).unwrap();
+        let words = emitted_words(&code);
+        assert_eq!(words[0], inst::tbz_x(16, 5, 8));
+        assert_eq!(words[1], inst::b_imm(40_004));
     }
 }
