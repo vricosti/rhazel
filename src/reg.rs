@@ -65,6 +65,16 @@ pub trait LdStReg: Copy {
 /// of the logical/permute mnemonics oaknut declares only for those two.
 pub trait VRegBytes: VRegArranged {}
 
+/// Low-half widening pairs accepted by Oaknut's SXTL/UXTL overloads.
+pub trait WideningSource: VRegArranged {
+    type Wide: VRegArranged;
+}
+
+/// Narrowing pairs accepted by Oaknut's XTN/SHRN overloads (not XTN2/SHRN2).
+pub trait NarrowingSource: VRegArranged {
+    type Narrow: VRegArranged;
+}
+
 macro_rules! register_type {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
@@ -123,6 +133,13 @@ register_type!(/// `Vn.1D`
     VReg1D);
 register_type!(/// `Vn.2D`
     VReg2D);
+
+impl WideningSource for VReg8B { type Wide = VReg8H; }
+impl WideningSource for VReg4H { type Wide = VReg4S; }
+impl WideningSource for VReg2S { type Wide = VReg2D; }
+impl NarrowingSource for VReg8H { type Narrow = VReg8B; }
+impl NarrowingSource for VReg4S { type Narrow = VReg4H; }
+impl NarrowingSource for VReg2D { type Narrow = VReg2S; }
 
 impl GpReg for WReg {
     const SF: bool = false;

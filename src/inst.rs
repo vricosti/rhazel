@@ -3088,10 +3088,15 @@ pub fn xtn_v(rd: u8, rn: u8, source_size: u8) -> u32 {
 /// `shrn vD.<narrow T>, vN.<wide T>, #shift`.
 pub fn shrn_v(rd: u8, rn: u8, source_size: u8, shift: u8) -> u32 {
     assert!(
+        matches!(source_size, 16 | 32 | 64),
+        "AArch64 SHRN source size must be 16, 32 or 64"
+    );
+    assert!(
         (1..=source_size / 2).contains(&shift),
         "AArch64 SHRN shift out of range"
     );
-    simd_shift_right(0x0f00_8400, rd, rn, source_size, shift, false)
+    // Narrowing encodes source_size - shift, unlike same-width right shifts.
+    simd_shift_right(0x0f00_8400, rd, rn, source_size / 2, shift, false)
 }
 
 /// `sqxtn vD.<narrow T>, vN.<wide T>`.
@@ -3194,12 +3199,22 @@ pub fn ldp_x_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> u32 {
 
 /// `stp qT, qT2, [sp, #imm]`.
 pub fn stp_q_offset_sp(rt: u8, rt2: u8, imm_bytes: i32) -> u32 {
-    0xad00_0000 | (imm7_scaled(imm_bytes, 16) << 15) | (reg5(rt2) << 10) | (31 << 5) | reg5(rt)
+    stp_q_offset(rt, rt2, 31, imm_bytes)
 }
 
 /// `ldp qT, qT2, [sp, #imm]`.
 pub fn ldp_q_offset_sp(rt: u8, rt2: u8, imm_bytes: i32) -> u32 {
-    0xad40_0000 | (imm7_scaled(imm_bytes, 16) << 15) | (reg5(rt2) << 10) | (31 << 5) | reg5(rt)
+    ldp_q_offset(rt, rt2, 31, imm_bytes)
+}
+
+/// `stp qT, qT2, [xN|sp, #imm]`.
+pub fn stp_q_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> u32 {
+    0xad00_0000 | (imm7_scaled(imm_bytes, 16) << 15) | (reg5(rt2) << 10) | (reg5(rn) << 5) | reg5(rt)
+}
+
+/// `ldp qT, qT2, [xN|sp, #imm]`.
+pub fn ldp_q_offset(rt: u8, rt2: u8, rn: u8, imm_bytes: i32) -> u32 {
+    0xad40_0000 | (imm7_scaled(imm_bytes, 16) << 15) | (reg5(rt2) << 10) | (reg5(rn) << 5) | reg5(rt)
 }
 
 /// `stp x29, x30, [sp, #-16]!`.
@@ -3877,6 +3892,10 @@ mod tests {
         assert_eq!(pmul_v(16, 17, 18, 8, true), 0x6e32_9e30);
         assert_eq!(sqdmulh_v(16, 17, 18, 16, true), 0x4e72_b630);
         assert_eq!(sqrdmulh_v(16, 17, 18, 16, true), 0x6e72_b630);
+        // Independently assembled with Clang (SHRN v5.8b/4h/2s, v6.8h/4s/2d).
+        assert_eq!(shrn_v(5, 6, 16, 1), 0x0f0f_84c5);
+        assert_eq!(shrn_v(5, 6, 32, 1), 0x0f1f_84c5);
+        assert_eq!(shrn_v(5, 6, 64, 1), 0x0f3f_84c5);
         assert_eq!(shrn_v(5, 6, 16, 8), 0x0f08_84c5);
         assert_eq!(shrn_v(5, 6, 32, 16), 0x0f10_84c5);
         assert_eq!(shrn_v(5, 6, 64, 32), 0x0f20_84c5);

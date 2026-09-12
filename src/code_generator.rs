@@ -20,8 +20,8 @@ use crate::cond::Cond;
 use crate::inst;
 use crate::label::Label;
 use crate::reg::{
-    DReg, FpReg, GpReg, GpRegSp, LdStKind, LdStReg, QReg, VReg16B, VReg2D, VReg4H, VReg4S,
-    VReg8H, VRegArranged, VRegBytes, WReg, XReg, XRegSp,
+    DReg, FpReg, GpReg, GpRegSp, LdStKind, LdStReg, NarrowingSource, QReg, VReg16B, VReg2D,
+    VReg4H, VReg4S, VReg8H, VRegArranged, VRegBytes, WReg, WideningSource, XReg, XRegSp,
 };
 use crate::enums::{BarrierOp, SystemReg};
 
@@ -266,6 +266,16 @@ impl<'a> CodeGenerator<'a> {
         } else {
             inst::stp_w_offset(rt.index(), rt2.index(), rn.index(), imm_bytes)
         })
+    }
+
+    /// `LDP(Qt, Qt2, [Xn|SP, #imm])`, the SIMD overload of LDP.
+    pub fn ldp_q(&mut self, rt: QReg, rt2: QReg, rn: impl Into<XRegSp>, imm_bytes: i32) -> Result<(), String> {
+        self.emit(inst::ldp_q_offset(rt.index(), rt2.index(), rn.into().index(), imm_bytes))
+    }
+
+    /// `STP(Qt, Qt2, [Xn|SP, #imm])`, the SIMD overload of STP.
+    pub fn stp_q(&mut self, rt: QReg, rt2: QReg, rn: impl Into<XRegSp>, imm_bytes: i32) -> Result<(), String> {
+        self.emit(inst::stp_q_offset(rt.index(), rt2.index(), rn.into().index(), imm_bytes))
     }
 
     /// `ADD(Xd|SP, Xn|SP, Xm)` — the extended-register form oaknut selects
@@ -602,22 +612,36 @@ impl<'a> CodeGenerator<'a> {
     // encoding, as in oaknut's per-arrangement overloads.
 
     /// `SXTL(Vd.Tw, Vn.Tn)`
-    pub fn sxtl<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+    pub fn sxtl<N: WideningSource>(&mut self, rd: N::Wide, rn: N) -> Result<(), String> {
         self.emit(inst::sxtl_v(rd.index(), rn.index(), N::SIZE))
     }
 
     /// `UXTL(Vd.Tw, Vn.Tn)`
-    pub fn uxtl<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+    pub fn uxtl<N: WideningSource>(&mut self, rd: N::Wide, rn: N) -> Result<(), String> {
         self.emit(inst::uxtl_v(rd.index(), rn.index(), N::SIZE))
     }
 
     /// `XTN(Vd.Tn, Vn.Tw)`
-    pub fn xtn<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+    pub fn xtn<N: NarrowingSource>(&mut self, rd: N::Narrow, rn: N) -> Result<(), String> {
         self.emit(inst::xtn_v(rd.index(), rn.index(), N::SIZE))
     }
 
     /// `SHRN(Vd.Tn, Vn.Tw, #shift)`
-    pub fn shrn<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N, shift: u8) -> Result<(), String> {
+    ///
+    /// Incompatible lane widths must be rejected before any code is emitted.
+    /// ```compile_fail
+    /// use rhazel::{CodeGenerator, V0, V1};
+    /// fn invalid(code: &mut CodeGenerator<'_>) {
+    ///     code.shrn(V0.b8(), V1.s4(), 8).unwrap();
+    /// }
+    /// ```
+    /// ```compile_fail
+    /// use rhazel::{CodeGenerator, V0, V1};
+    /// fn invalid(code: &mut CodeGenerator<'_>) {
+    ///     code.sxtl(V0.s4(), V1.b8()).unwrap();
+    /// }
+    /// ```
+    pub fn shrn<N: NarrowingSource>(&mut self, rd: N::Narrow, rn: N, shift: u8) -> Result<(), String> {
         self.emit(inst::shrn_v(rd.index(), rn.index(), N::SIZE, shift))
     }
 
@@ -811,6 +835,24 @@ mod tests {
                 unsafe { p.read_unaligned() }
             })
             .collect()
+    }
+
+    #[test]
+    fn q_pair_offsets_match_clang_encodings() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        let mut code = CodeGenerator::new(&mut block);
+        code.stp_q(Q8, Q9, SP, 96).unwrap();
+        code.ldp_q(Q8, Q9, SP, 96).unwrap();
+        code.stp_q(Q0, Q31, X7, -1024).unwrap();
+        code.ldp_q(Q31, Q0, X7, 1008).unwrap();
+        assert_eq!(words(&block), [0xad03_27e8, 0xad43_27e8, 0xad20_7ce0, 0xad5f_80ff]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of imm7 range")]
+    fn q_pair_rejects_offset_past_signed_limit() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        CodeGenerator::new(&mut block).stp_q(Q0, Q1, SP, 1024).unwrap();
     }
 
     #[test]
