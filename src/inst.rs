@@ -801,6 +801,12 @@ pub fn eor_x_reg(rd: u8, rn: u8, rm: u8) -> u32 {
     0xca00_0000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
 }
 
+/// `tst wN, #imm`.
+pub fn tst_w_imm(rn: u8, imm: u32) -> u32 {
+    let (n, immr, imms) = logical_imm32(imm);
+    0x7200_001f | (n << 22) | (immr << 16) | (imms << 10) | (reg5(rn) << 5)
+}
+
 /// `tst xN, #imm`.
 pub fn tst_x_imm(rn: u8, imm: u64) -> u32 {
     let (n, immr, imms) = logical_imm64(imm);
@@ -3565,6 +3571,9 @@ mod tests {
         assert_eq!(bic_v8h_imm(4, 0x80, 8), 0x6f04_b404);
         assert_eq!(bic_v8h_imm(4, 0x80, 0), 0x6f04_9404);
         assert_eq!(str_b_unsigned(1, 2, 3), 0x3d00_0c41);
+        assert_eq!(ldp_w_offset(1, 2, 3, 8), 0x2941_0861);
+        assert_eq!(stp_w_offset(1, 2, 3, 8), 0x2901_0861);
+        assert_eq!(tst_w_imm(1, 1), 0x7200_003f);
         assert_eq!(ldr_h_unsigned(5, 6, 8), 0x7d40_10c5);
         assert_eq!(fmax_s(0, 1, 2), 0x1e22_4820);
         assert_eq!(fmax_d(3, 4, 5), 0x1e65_4883);

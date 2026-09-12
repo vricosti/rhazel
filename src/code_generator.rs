@@ -133,13 +133,23 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// `CBZ(XReg, Label&)`
-    pub fn cbz(&mut self, rt: XReg, label: &mut Label) -> Result<(), String> {
-        label.cbz_x(self.code, rt.index()).map(|_| ())
+    pub fn cbz<R: GpReg>(&mut self, rt: R, label: &mut Label) -> Result<(), String> {
+        if R::SF {
+            label.cbz_x(self.code, rt.index())?;
+        } else {
+            label.cbz_w(self.code, rt.index())?;
+        }
+        Ok(())
     }
 
-    /// `CBNZ(XReg, Label&)`
-    pub fn cbnz(&mut self, rt: XReg, label: &mut Label) -> Result<(), String> {
-        label.cbnz_x(self.code, rt.index()).map(|_| ())
+    /// `CBNZ(Rt, label)`
+    pub fn cbnz<R: GpReg>(&mut self, rt: R, label: &mut Label) -> Result<(), String> {
+        if R::SF {
+            label.cbnz_x(self.code, rt.index())?;
+        } else {
+            label.cbnz_w(self.code, rt.index())?;
+        }
+        Ok(())
     }
 
     /// `TBNZ(XReg, Imm<6>, Label&)`; see [`Label::tbnz_x`] for the far-target
@@ -209,6 +219,79 @@ impl<'a> CodeGenerator<'a> {
         })
     }
 
+    /// `BR(Xn)`
+    pub fn br(&mut self, rn: XReg) -> Result<(), String> {
+        self.emit(inst::br(rn.index()))
+    }
+
+    /// `LDAR(Rt, [Xn|SP])`
+    pub fn ldar<R: GpReg>(&mut self, rt: R, rn: impl Into<XRegSp>) -> Result<(), String> {
+        let rn = rn.into();
+        self.emit(if R::SF {
+            inst::ldar_x(rt.index(), rn.index())
+        } else {
+            inst::ldar_w(rt.index(), rn.index())
+        })
+    }
+
+    /// `LDRB(Wt, [Xn|SP, #imm])`
+    pub fn ldrb(&mut self, wt: WReg, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+        self.emit(inst::ldrb_w_unsigned(wt.index(), rn.into().index(), imm_bytes))
+    }
+
+    /// `LDP(Rt, Rt2, [Xn|SP, #imm])`
+    pub fn ldp<R: GpReg>(&mut self, rt: R, rt2: R, rn: impl Into<XRegSp>, imm_bytes: i32) -> Result<(), String> {
+        let rn = rn.into();
+        self.emit(if R::SF {
+            inst::ldp_x_offset(rt.index(), rt2.index(), rn.index(), imm_bytes)
+        } else {
+            inst::ldp_w_offset(rt.index(), rt2.index(), rn.index(), imm_bytes)
+        })
+    }
+
+    /// `STP(Rt, Rt2, [Xn|SP, #imm])`
+    pub fn stp<R: GpReg>(&mut self, rt: R, rt2: R, rn: impl Into<XRegSp>, imm_bytes: i32) -> Result<(), String> {
+        let rn = rn.into();
+        self.emit(if R::SF {
+            inst::stp_x_offset(rt.index(), rt2.index(), rn.index(), imm_bytes)
+        } else {
+            inst::stp_w_offset(rt.index(), rt2.index(), rn.index(), imm_bytes)
+        })
+    }
+
+    /// `ADD(Xd|SP, Xn|SP, Xm)` — the extended-register form oaknut selects
+    /// for `SP` operands (`UXTX #0`).
+    pub fn add_ext(&mut self, rd: impl Into<XRegSp>, rn: impl Into<XRegSp>, rm: XReg) -> Result<(), String> {
+        self.emit(inst::add_x_reg_sp(rd.into().index(), rn.into().index(), rm.index()))
+    }
+
+    /// `AND(Rd, Rn, #imm)` (bitmask immediate)
+    pub fn and_imm<R: GpReg>(&mut self, rd: R, rn: R, imm: u64) -> Result<(), String> {
+        self.emit(if R::SF {
+            inst::and_x_imm(rd.index(), rn.index(), imm)
+        } else {
+            inst::and_w_imm(rd.index(), rn.index(), imm as u32)
+        })
+    }
+
+    /// `TST(Rn, #imm)` (bitmask immediate)
+    pub fn tst_imm<R: GpReg>(&mut self, rn: R, imm: u64) -> Result<(), String> {
+        self.emit(if R::SF {
+            inst::tst_x_imm(rn.index(), imm)
+        } else {
+            inst::tst_w_imm(rn.index(), imm as u32)
+        })
+    }
+
+    /// `LSL(Rd, Rn, #shift)`
+    pub fn lsl<R: GpReg>(&mut self, rd: R, rn: R, shift: u8) -> Result<(), String> {
+        self.emit(if R::SF {
+            inst::lsl_x_imm(rd.index(), rn.index(), shift)
+        } else {
+            inst::lsl_w_imm(rd.index(), rn.index(), shift)
+        })
+    }
+
     /// `MSR(SystemReg, Xt)`
     pub fn msr(&mut self, sysreg: SystemReg, rt: XReg) -> Result<(), String> {
         self.emit(match sysreg {
@@ -262,6 +345,14 @@ impl<'a> CodeGenerator<'a> {
         subs, subs_w_reg, subs_x_reg);
     gp_mnemonic3!(/// `EOR(Rd, Rn, Rm)`
         eor, eor_w_reg, eor_x_reg);
+    gp_mnemonic3!(/// `ADD(Rd, Rn, Rm)`
+        add, add_w_reg, add_x_reg);
+    gp_mnemonic3!(/// `SUB(Rd, Rn, Rm)`
+        sub, sub_w_reg, sub_x_reg);
+    gp_mnemonic3!(/// `AND(Rd, Rn, Rm)`
+        and, and_w_reg, and_x_reg);
+    gp_mnemonic3!(/// `ORR(Rd, Rn, Rm)`
+        orr, orr_w, orr_x);
 
     /// `ASR(Rd, Rn, Imm<6>)`
     pub fn asr<R: GpReg>(&mut self, rd: R, rn: R, shift: u8) -> Result<(), String> {
@@ -847,9 +938,59 @@ mod tests {
         let mut code = CodeGenerator::new(&mut block);
         let mut label = Label::new();
         code.cbz(X0, &mut label).unwrap();
+        code.cbnz(W16, &mut label).unwrap();
         code.nop().unwrap();
         code.l(&mut label).unwrap();
         drop(code);
-        assert_eq!(words(&block), vec![inst::cbz_x(0, 8), inst::nop()]);
+        assert_eq!(
+            words(&block),
+            vec![inst::cbz_x(0, 12), inst::cbnz_w(16, 8), inst::nop()]
+        );
+    }
+
+    #[test]
+    fn terminal_mnemonics_match_the_encoders() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        let mut code = CodeGenerator::new(&mut block);
+        code.br(X17).unwrap();
+        code.ldar(W16, X27).unwrap();
+        code.ldar(X16, X27).unwrap();
+        code.ldrb(W16, SP, 0x30).unwrap();
+        code.ldp(X16, X17, X2, 0x40).unwrap();
+        code.stp(W1, W2, SP, 8).unwrap();
+        code.add_ext(X2, SP, X30).unwrap();
+        code.and_imm(X1, X1, 0x00ff_ffff_ffff_ffff).unwrap();
+        code.and_imm(W30, W30, 0xff0).unwrap();
+        code.tst_imm(X16, 0x10).unwrap();
+        code.tst_imm(W16, 1).unwrap();
+        code.lsl(X0, X0, 37).unwrap();
+        code.add(X1, X2, X3).unwrap();
+        code.sub(X1, X1, X26).unwrap();
+        code.and(W0, W0, W16).unwrap();
+        code.orr(X0, X0, X1).unwrap();
+        code.msr(SystemReg::NZCV, X16).unwrap();
+        drop(code);
+        assert_eq!(
+            words(&block),
+            vec![
+                inst::br(17),
+                inst::ldar_w(16, 27),
+                inst::ldar_x(16, 27),
+                inst::ldrb_w_unsigned(16, 31, 0x30),
+                inst::ldp_x_offset(16, 17, 2, 0x40),
+                inst::stp_w_offset(1, 2, 31, 8),
+                inst::add_x_reg_sp(2, 31, 30),
+                inst::and_x_imm(1, 1, 0x00ff_ffff_ffff_ffff),
+                inst::and_w_imm(30, 30, 0xff0),
+                inst::tst_x_imm(16, 0x10),
+                inst::tst_w_imm(16, 1),
+                inst::lsl_x_imm(0, 0, 37),
+                inst::add_x_reg(1, 2, 3),
+                inst::sub_x_reg(1, 1, 26),
+                inst::and_w_reg(0, 0, 16),
+                inst::orr_x(0, 0, 1),
+                inst::msr_nzcv(16),
+            ]
+        );
     }
 }

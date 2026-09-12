@@ -11,8 +11,24 @@ use crate::cond::Cond;
 enum PendingBranch {
     Uncond { offset: usize },
     Cond { offset: usize, cond: Cond },
-    CbzX { offset: usize, rt: u8 },
-    CbnzX { offset: usize, rt: u8 },
+    Cbz { offset: usize, rt: u8, sf: bool },
+    Cbnz { offset: usize, rt: u8, sf: bool },
+}
+
+fn cbz_word(rt: u8, sf: bool, pc_offset: i32) -> u32 {
+    if sf {
+        inst::cbz_x(rt, pc_offset)
+    } else {
+        inst::cbz_w(rt, pc_offset)
+    }
+}
+
+fn cbnz_word(rt: u8, sf: bool, pc_offset: i32) -> u32 {
+    if sf {
+        inst::cbnz_x(rt, pc_offset)
+    } else {
+        inst::cbnz_w(rt, pc_offset)
+    }
 }
 
 #[derive(Default, Debug)]
@@ -42,13 +58,13 @@ impl Label {
                     let pc_offset = branch_pc_offset(offset, target_offset)?;
                     code.patch_u32(offset, inst::b_cond(cond, pc_offset))?;
                 }
-                PendingBranch::CbzX { offset, rt } => {
+                PendingBranch::Cbz { offset, rt, sf } => {
                     let pc_offset = branch_pc_offset(offset, target_offset)?;
-                    code.patch_u32(offset, inst::cbz_x(rt, pc_offset))?;
+                    code.patch_u32(offset, cbz_word(rt, sf, pc_offset))?;
                 }
-                PendingBranch::CbnzX { offset, rt } => {
+                PendingBranch::Cbnz { offset, rt, sf } => {
                     let pc_offset = branch_pc_offset(offset, target_offset)?;
-                    code.patch_u32(offset, inst::cbnz_x(rt, pc_offset))?;
+                    code.patch_u32(offset, cbnz_word(rt, sf, pc_offset))?;
                 }
             }
         }
@@ -79,23 +95,39 @@ impl Label {
     }
 
     pub fn cbz_x(&mut self, code: &mut BlockOfCode, rt: u8) -> Result<usize, String> {
-        let offset = code.write_u32(inst::cbz_x(rt, 0))?;
+        self.cbz(code, rt, true)
+    }
+
+    pub fn cbz_w(&mut self, code: &mut BlockOfCode, rt: u8) -> Result<usize, String> {
+        self.cbz(code, rt, false)
+    }
+
+    pub fn cbnz_x(&mut self, code: &mut BlockOfCode, rt: u8) -> Result<usize, String> {
+        self.cbnz(code, rt, true)
+    }
+
+    pub fn cbnz_w(&mut self, code: &mut BlockOfCode, rt: u8) -> Result<usize, String> {
+        self.cbnz(code, rt, false)
+    }
+
+    fn cbz(&mut self, code: &mut BlockOfCode, rt: u8, sf: bool) -> Result<usize, String> {
+        let offset = code.write_u32(cbz_word(rt, sf, 0))?;
         if let Some(target_offset) = self.offset {
             let pc_offset = branch_pc_offset(offset, target_offset)?;
-            code.patch_u32(offset, inst::cbz_x(rt, pc_offset))?;
+            code.patch_u32(offset, cbz_word(rt, sf, pc_offset))?;
         } else {
-            self.pending.push(PendingBranch::CbzX { offset, rt });
+            self.pending.push(PendingBranch::Cbz { offset, rt, sf });
         }
         Ok(offset)
     }
 
-    pub fn cbnz_x(&mut self, code: &mut BlockOfCode, rt: u8) -> Result<usize, String> {
-        let offset = code.write_u32(inst::cbnz_x(rt, 0))?;
+    fn cbnz(&mut self, code: &mut BlockOfCode, rt: u8, sf: bool) -> Result<usize, String> {
+        let offset = code.write_u32(cbnz_word(rt, sf, 0))?;
         if let Some(target_offset) = self.offset {
             let pc_offset = branch_pc_offset(offset, target_offset)?;
-            code.patch_u32(offset, inst::cbnz_x(rt, pc_offset))?;
+            code.patch_u32(offset, cbnz_word(rt, sf, pc_offset))?;
         } else {
-            self.pending.push(PendingBranch::CbnzX { offset, rt });
+            self.pending.push(PendingBranch::Cbnz { offset, rt, sf });
         }
         Ok(offset)
     }
@@ -177,15 +209,19 @@ mod tests {
         label.b(&mut code).unwrap();
         label.cbz_x(&mut code, 16).unwrap();
         label.cbnz_x(&mut code, 17).unwrap();
+        label.cbz_w(&mut code, 16).unwrap();
+        label.cbnz_w(&mut code, 17).unwrap();
         code.write_u32(inst::nop()).unwrap();
         label.bind(&mut code).unwrap();
 
         assert_eq!(
             emitted_words(&code),
             vec![
-                inst::b_imm(16),
-                inst::cbz_x(16, 12),
-                inst::cbnz_x(17, 8),
+                inst::b_imm(24),
+                inst::cbz_x(16, 20),
+                inst::cbnz_x(17, 16),
+                inst::cbz_w(16, 12),
+                inst::cbnz_w(17, 8),
                 inst::nop()
             ]
         );
