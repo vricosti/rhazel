@@ -148,7 +148,10 @@ impl BlockOfCode {
                 "ARM64 patch offset is not instruction-aligned: {offset}"
             ));
         }
-        if offset + INSTRUCTION_SIZE > self.size {
+        if offset
+            .checked_add(INSTRUCTION_SIZE)
+            .map_or(true, |end| end > self.size)
+        {
             return Err(format!(
                 "ARM64 patch offset out of code cache range: {offset}"
             ));

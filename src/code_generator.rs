@@ -9,24 +9,32 @@
 //! (register vs immediate) keep a suffix, e.g. `cmp` / `cmp_imm`, and
 //! `B(Cond, Label&)` is `b_cond`.
 //!
-//! The generator dereferences to its `BlockOfCode`, so callers that still
-//! emit raw words through `write_u32` or drive a [`Label`] directly keep
-//! working while they migrate; the encoders themselves stay in [`crate::inst`].
+//! Backend consumers emit through typed mnemonics; raw instruction encoders
+//! remain internal to the assembler in [`crate::inst`]. Dereferencing to
+//! [`BlockOfCode`] is retained only for code-buffer storage compatibility.
+//! Patch generators reject label operations and mutable dereferencing: those
+//! paths use the append cursor rather than the independent patch cursor.
 
 use std::ops::{Deref, DerefMut};
 
+mod a32_memory;
+mod data_processing;
+pub mod scalar_fp;
+mod vector;
+
 use crate::block_of_code::BlockOfCode;
 use crate::cond::Cond;
+use crate::enums::{BarrierOp, SystemReg};
 use crate::inst;
 use crate::label::Label;
 use crate::reg::{
-    DReg, FpReg, GpReg, GpRegSp, LdStKind, LdStReg, QReg, VReg16B, VReg2D, VReg4H, VReg4S,
-    VReg8H, VRegArranged, VRegBytes, WReg, XReg, XRegSp,
+    DReg, FpReg, GpReg, GpRegSp, LdStKind, LdStReg, NarrowingSource, QReg, VReg16B, VReg2D, VReg4H,
+    VReg4S, VReg8H, VRegArranged, VRegBytes, WReg, WideningSource, XReg, XRegSp,
 };
-use crate::enums::{BarrierOp, SystemReg};
 
 pub struct CodeGenerator<'a> {
     code: &'a mut BlockOfCode,
+    patch: Option<(usize, bool)>,
 }
 
 impl<'a> Deref for CodeGenerator<'a> {
@@ -38,6 +46,10 @@ impl<'a> Deref for CodeGenerator<'a> {
 
 impl<'a> DerefMut for CodeGenerator<'a> {
     fn deref_mut(&mut self) -> &mut BlockOfCode {
+        assert!(
+            self.patch.is_none(),
+            "ARM64 patch generator cannot mutably dereference the append buffer"
+        );
         self.code
     }
 }
@@ -117,15 +129,147 @@ fn arith_imm_shift12(shift: u8) -> bool {
 
 impl<'a> CodeGenerator<'a> {
     pub fn new(code: &'a mut BlockOfCode) -> Self {
-        Self { code }
+        Self { code, patch: None }
     }
 
     fn emit(&mut self, word: u32) -> Result<(), String> {
+        if let Some((offset, deferred)) = &mut self.patch {
+            if *deferred {
+                self.code.patch_u32_deferred_icache(*offset, word)?;
+            } else {
+                self.code.patch_u32(*offset, word)?;
+            }
+            *offset += 4;
+            return Ok(());
+        }
         self.code.write_u32(word).map(|_| ())
+    }
+
+    /// A generator over existing code, like Oaknut's generator at a patch pointer.
+    /// The append cursor is unaffected. The owner decides when to invalidate code.
+    /// Label operations return an error; mutable dereferencing panics before
+    /// exposing the append buffer. Use direct-target or relative-offset mnemonics.
+    pub fn patch_at(code: &'a mut BlockOfCode, offset: usize, deferred_icache: bool) -> Self {
+        Self {
+            code,
+            patch: Some((offset, deferred_icache)),
+        }
+    }
+
+    pub fn code_size(&self) -> usize {
+        self.patch
+            .map_or_else(|| self.code.code_size(), |(offset, _)| offset)
+    }
+
+    pub fn b_offset(&mut self, offset: isize) -> Result<(), String> {
+        self.emit(inst::b_imm(offset))
+    }
+
+    pub fn bl_offset(&mut self, offset: isize) -> Result<(), String> {
+        self.emit(inst::bl_imm(offset))
+    }
+
+    pub fn b_to(&mut self, target: *const u8) -> Result<(), String> {
+        self.b_offset(self.relative_offset(target)?)
+    }
+
+    pub fn bl_to(&mut self, target: *const u8) -> Result<(), String> {
+        self.bl_offset(self.relative_offset(target)?)
+    }
+
+    fn relative_offset(&self, target: *const u8) -> Result<isize, String> {
+        (target as isize)
+            .checked_sub(self.code.code_base_ptr().wrapping_add(self.code_size()) as isize)
+            .ok_or_else(|| "ARM64 branch offset overflow".to_string())
+    }
+
+    pub fn adrl(&mut self, rd: XReg, target: *const u8) -> Result<(), String> {
+        let source_page =
+            self.code.code_base_ptr().wrapping_add(self.code_size()) as usize & !0xfff;
+        let target_page = target as usize & !0xfff;
+        let offset = (target_page as isize)
+            .checked_sub(source_page as isize)
+            .ok_or_else(|| "ARM64 ADRL page offset overflow".to_string())?;
+        self.emit(inst::adrp(rd.index(), offset))?;
+        self.add_imm(rd, rd, (target as usize & 0xfff) as u32)
+    }
+
+    pub fn b_cond_offset(&mut self, cond: impl Into<Cond>, offset: i32) -> Result<(), String> {
+        self.emit(inst::b_cond(cond, offset))
+    }
+
+    pub fn cbnz_offset<R: GpReg>(&mut self, rt: R, offset: i32) -> Result<(), String> {
+        self.emit(if R::SF {
+            inst::cbnz_x(rt.index(), offset)
+        } else {
+            inst::cbnz_w(rt.index(), offset)
+        })
+    }
+
+    pub fn ldr_literal(&mut self, rt: XReg, offset: i32) -> Result<(), String> {
+        self.emit(inst::ldr_x_lit(rt.index(), offset))
+    }
+
+    pub fn ldaxr<R: GpReg>(&mut self, rt: R, rn: impl Into<XRegSp>) -> Result<(), String> {
+        self.emit(if R::SF {
+            inst::ldaxr_x(rt.index(), rn.into().index())
+        } else {
+            inst::ldaxr_w(rt.index(), rn.into().index())
+        })
+    }
+
+    pub fn stlxr<R: GpReg>(
+        &mut self,
+        status: WReg,
+        rt: R,
+        rn: impl Into<XRegSp>,
+    ) -> Result<(), String> {
+        self.emit(if R::SF {
+            inst::stlxr_x(status.index(), rt.index(), rn.into().index())
+        } else {
+            inst::stlxr_w(status.index(), rt.index(), rn.into().index())
+        })
+    }
+
+    pub fn ret(&mut self) -> Result<(), String> {
+        self.emit(inst::ret_lr())
+    }
+
+    pub fn fmov_high_from_gp(&mut self, rd: VReg2D, rn: XReg) -> Result<(), String> {
+        self.emit(inst::fmov_v_d1_from_x(rd.index(), rn.index()))
+    }
+
+    pub fn fmov_high_to_gp(&mut self, rd: XReg, rn: VReg2D) -> Result<(), String> {
+        self.emit(inst::fmov_x_from_v_d1(rd.index(), rn.index()))
+    }
+
+    pub fn orr_lsl(&mut self, rd: WReg, rn: WReg, rm: WReg, shift: u8) -> Result<(), String> {
+        self.emit(inst::orr_w_lsl(rd.index(), rn.index(), rm.index(), shift))
+    }
+
+    pub fn orr_lsr(&mut self, rd: WReg, rn: WReg, rm: WReg, shift: u8) -> Result<(), String> {
+        self.emit(inst::orr_w_lsr(rd.index(), rn.index(), rm.index(), shift))
+    }
+
+    pub fn bfxil(&mut self, rd: WReg, rn: WReg, lsb: u8, width: u8) -> Result<(), String> {
+        self.emit(inst::bfxil_w(rd.index(), rn.index(), lsb, width))
+    }
+
+    pub fn sbfm(&mut self, rd: XReg, rn: XReg, immr: u8, imms: u8) -> Result<(), String> {
+        self.emit(inst::sbfm_x(rd.index(), rn.index(), immr, imms))
+    }
+
+    // Label fixups currently track BlockOfCode's append cursor, not the patch PC.
+    fn require_append_label_mode(&self) -> Result<(), String> {
+        if self.patch.is_some() {
+            return Err("ARM64 patch generator does not support label operations".to_string());
+        }
+        Ok(())
     }
 
     /// Bind `label` here — `oaknut::BasicCodeGenerator::l`.
     pub fn l(&mut self, label: &mut Label) -> Result<(), String> {
+        self.require_append_label_mode()?;
         label.bind(self.code)
     }
 
@@ -133,16 +277,19 @@ impl<'a> CodeGenerator<'a> {
 
     /// `B(Label&)`
     pub fn b(&mut self, label: &mut Label) -> Result<(), String> {
+        self.require_append_label_mode()?;
         label.b(self.code).map(|_| ())
     }
 
     /// `B(Cond, Label&)`
     pub fn b_cond(&mut self, cond: impl Into<Cond>, label: &mut Label) -> Result<(), String> {
+        self.require_append_label_mode()?;
         label.b_cond(self.code, cond).map(|_| ())
     }
 
     /// `CBZ(XReg, Label&)`
     pub fn cbz<R: GpReg>(&mut self, rt: R, label: &mut Label) -> Result<(), String> {
+        self.require_append_label_mode()?;
         if R::SF {
             label.cbz_x(self.code, rt.index())?;
         } else {
@@ -153,6 +300,7 @@ impl<'a> CodeGenerator<'a> {
 
     /// `CBNZ(Rt, label)`
     pub fn cbnz<R: GpReg>(&mut self, rt: R, label: &mut Label) -> Result<(), String> {
+        self.require_append_label_mode()?;
         if R::SF {
             label.cbnz_x(self.code, rt.index())?;
         } else {
@@ -164,6 +312,7 @@ impl<'a> CodeGenerator<'a> {
     /// `TBNZ(XReg, Imm<6>, Label&)`; see [`Label::tbnz_x`] for the far-target
     /// fallback that oaknut does not have.
     pub fn tbnz(&mut self, rt: XReg, bit: u8, label: &mut Label) -> Result<(), String> {
+        self.require_append_label_mode()?;
         label.tbnz_x(self.code, rt.index(), bit).map(|_| ())
     }
 
@@ -180,7 +329,12 @@ impl<'a> CodeGenerator<'a> {
     // --- Loads and stores (unsigned immediate offset) -----------------------
 
     /// `STR(Rt, [Xn|SP, #imm])` for every GP and FP/SIMD register width.
-    pub fn str<R: LdStReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+    pub fn str<R: LdStReg>(
+        &mut self,
+        rt: R,
+        rn: impl Into<XRegSp>,
+        imm_bytes: u32,
+    ) -> Result<(), String> {
         let (rt, rn) = (rt.index(), rn.into().index());
         self.emit(match R::KIND {
             LdStKind::W => inst::str_w_unsigned(rt, rn, imm_bytes),
@@ -194,7 +348,12 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// `LDR(Rt, [Xn|SP, #imm])` for every GP and FP/SIMD register width.
-    pub fn ldr<R: LdStReg>(&mut self, rt: R, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
+    pub fn ldr<R: LdStReg>(
+        &mut self,
+        rt: R,
+        rn: impl Into<XRegSp>,
+        imm_bytes: u32,
+    ) -> Result<(), String> {
         let (rt, rn) = (rt.index(), rn.into().index());
         self.emit(match R::KIND {
             LdStKind::W => inst::ldr_w_unsigned(rt, rn, imm_bytes),
@@ -245,11 +404,40 @@ impl<'a> CodeGenerator<'a> {
 
     /// `LDRB(Wt, [Xn|SP, #imm])`
     pub fn ldrb(&mut self, wt: WReg, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
-        self.emit(inst::ldrb_w_unsigned(wt.index(), rn.into().index(), imm_bytes))
+        self.emit(inst::ldrb_w_unsigned(
+            wt.index(),
+            rn.into().index(),
+            imm_bytes,
+        ))
+    }
+
+    /// `FMOV(Dd, Xn)` (bit transfer, not conversion).
+    pub fn fmov_from_gp(&mut self, rd: DReg, rn: XReg) -> Result<(), String> {
+        self.emit(inst::fmov_d_from_x(rd.index(), rn.index()))
+    }
+
+    /// `FMOV(Xd, Dn)` (bit transfer, not conversion).
+    pub fn fmov_to_gp(&mut self, rd: XReg, rn: DReg) -> Result<(), String> {
+        self.emit(inst::fmov_x_from_d(rd.index(), rn.index()))
+    }
+
+    /// `MOV(Vd.8B|16B, Vn.8B|16B)`.
+    pub fn mov_v<V: VRegBytes>(&mut self, rd: V, rn: V) -> Result<(), String> {
+        self.emit(if V::Q {
+            inst::orr_v16b(rd.index(), rn.index(), rn.index())
+        } else {
+            inst::orr_v8b(rd.index(), rn.index(), rn.index())
+        })
     }
 
     /// `LDP(Rt, Rt2, [Xn|SP, #imm])`
-    pub fn ldp<R: GpReg>(&mut self, rt: R, rt2: R, rn: impl Into<XRegSp>, imm_bytes: i32) -> Result<(), String> {
+    pub fn ldp<R: GpReg>(
+        &mut self,
+        rt: R,
+        rt2: R,
+        rn: impl Into<XRegSp>,
+        imm_bytes: i32,
+    ) -> Result<(), String> {
         let rn = rn.into();
         self.emit(if R::SF {
             inst::ldp_x_offset(rt.index(), rt2.index(), rn.index(), imm_bytes)
@@ -259,7 +447,13 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// `STP(Rt, Rt2, [Xn|SP, #imm])`
-    pub fn stp<R: GpReg>(&mut self, rt: R, rt2: R, rn: impl Into<XRegSp>, imm_bytes: i32) -> Result<(), String> {
+    pub fn stp<R: GpReg>(
+        &mut self,
+        rt: R,
+        rt2: R,
+        rn: impl Into<XRegSp>,
+        imm_bytes: i32,
+    ) -> Result<(), String> {
         let rn = rn.into();
         self.emit(if R::SF {
             inst::stp_x_offset(rt.index(), rt2.index(), rn.index(), imm_bytes)
@@ -268,10 +462,51 @@ impl<'a> CodeGenerator<'a> {
         })
     }
 
+    /// `LDP(Qt, Qt2, [Xn|SP, #imm])`, the SIMD overload of LDP.
+    pub fn ldp_q(
+        &mut self,
+        rt: QReg,
+        rt2: QReg,
+        rn: impl Into<XRegSp>,
+        imm_bytes: i32,
+    ) -> Result<(), String> {
+        self.emit(inst::ldp_q_offset(
+            rt.index(),
+            rt2.index(),
+            rn.into().index(),
+            imm_bytes,
+        ))
+    }
+
+    /// `STP(Qt, Qt2, [Xn|SP, #imm])`, the SIMD overload of STP.
+    pub fn stp_q(
+        &mut self,
+        rt: QReg,
+        rt2: QReg,
+        rn: impl Into<XRegSp>,
+        imm_bytes: i32,
+    ) -> Result<(), String> {
+        self.emit(inst::stp_q_offset(
+            rt.index(),
+            rt2.index(),
+            rn.into().index(),
+            imm_bytes,
+        ))
+    }
+
     /// `ADD(Xd|SP, Xn|SP, Xm)` — the extended-register form oaknut selects
     /// for `SP` operands (`UXTX #0`).
-    pub fn add_ext(&mut self, rd: impl Into<XRegSp>, rn: impl Into<XRegSp>, rm: XReg) -> Result<(), String> {
-        self.emit(inst::add_x_reg_sp(rd.into().index(), rn.into().index(), rm.index()))
+    pub fn add_ext(
+        &mut self,
+        rd: impl Into<XRegSp>,
+        rn: impl Into<XRegSp>,
+        rm: XReg,
+    ) -> Result<(), String> {
+        self.emit(inst::add_x_reg_sp(
+            rd.into().index(),
+            rn.into().index(),
+            rm.index(),
+        ))
     }
 
     /// `AND(Rd, Rn, #imm)` (bitmask immediate)
@@ -318,11 +553,21 @@ impl<'a> CodeGenerator<'a> {
 
     /// `STRB(Wt, [Xn|SP, #imm])`
     pub fn strb(&mut self, wt: WReg, rn: impl Into<XRegSp>, imm_bytes: u32) -> Result<(), String> {
-        self.emit(inst::strb_w_unsigned(wt.index(), rn.into().index(), imm_bytes))
+        self.emit(inst::strb_w_unsigned(
+            wt.index(),
+            rn.into().index(),
+            imm_bytes,
+        ))
     }
 
     /// `ADD(Rd|SP, Rn|SP, #imm12, LSL #shift)` with `shift` 0 or 12.
-    pub fn add_imm_shift<R: GpRegSp>(&mut self, rd: impl Into<R>, rn: R, imm12: u32, shift: u8) -> Result<(), String> {
+    pub fn add_imm_shift<R: GpRegSp>(
+        &mut self,
+        rd: impl Into<R>,
+        rn: R,
+        imm12: u32,
+        shift: u8,
+    ) -> Result<(), String> {
         let rd = rd.into();
         let shift12 = arith_imm_shift12(shift);
         self.emit(if R::SF {
@@ -333,7 +578,13 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// `SUB(Rd|SP, Rn|SP, #imm12, LSL #shift)` with `shift` 0 or 12.
-    pub fn sub_imm_shift<R: GpRegSp>(&mut self, rd: impl Into<R>, rn: R, imm12: u32, shift: u8) -> Result<(), String> {
+    pub fn sub_imm_shift<R: GpRegSp>(
+        &mut self,
+        rd: impl Into<R>,
+        rn: R,
+        imm12: u32,
+        shift: u8,
+    ) -> Result<(), String> {
         let rd = rd.into();
         let shift12 = arith_imm_shift12(shift);
         self.emit(if R::SF {
@@ -470,7 +721,13 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// `CSEL(Rd, Rn, Rm, Cond)`
-    pub fn csel<R: GpReg>(&mut self, rd: R, rn: R, rm: R, cond: impl Into<Cond>) -> Result<(), String> {
+    pub fn csel<R: GpReg>(
+        &mut self,
+        rd: R,
+        rn: R,
+        rm: R,
+        cond: impl Into<Cond>,
+    ) -> Result<(), String> {
         let cond: Cond = cond.into();
         self.emit(if R::SF {
             inst::csel_x(rd.index(), rn.index(), rm.index(), cond)
@@ -602,22 +859,41 @@ impl<'a> CodeGenerator<'a> {
     // encoding, as in oaknut's per-arrangement overloads.
 
     /// `SXTL(Vd.Tw, Vn.Tn)`
-    pub fn sxtl<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+    pub fn sxtl<N: WideningSource>(&mut self, rd: N::Wide, rn: N) -> Result<(), String> {
         self.emit(inst::sxtl_v(rd.index(), rn.index(), N::SIZE))
     }
 
     /// `UXTL(Vd.Tw, Vn.Tn)`
-    pub fn uxtl<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+    pub fn uxtl<N: WideningSource>(&mut self, rd: N::Wide, rn: N) -> Result<(), String> {
         self.emit(inst::uxtl_v(rd.index(), rn.index(), N::SIZE))
     }
 
     /// `XTN(Vd.Tn, Vn.Tw)`
-    pub fn xtn<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N) -> Result<(), String> {
+    pub fn xtn<N: NarrowingSource>(&mut self, rd: N::Narrow, rn: N) -> Result<(), String> {
         self.emit(inst::xtn_v(rd.index(), rn.index(), N::SIZE))
     }
 
     /// `SHRN(Vd.Tn, Vn.Tw, #shift)`
-    pub fn shrn<D: VRegArranged, N: VRegArranged>(&mut self, rd: D, rn: N, shift: u8) -> Result<(), String> {
+    ///
+    /// Incompatible lane widths must be rejected before any code is emitted.
+    /// ```compile_fail
+    /// use rhazel::{CodeGenerator, V0, V1};
+    /// fn invalid(code: &mut CodeGenerator<'_>) {
+    ///     code.shrn(V0.b8(), V1.s4(), 8).unwrap();
+    /// }
+    /// ```
+    /// ```compile_fail
+    /// use rhazel::{CodeGenerator, V0, V1};
+    /// fn invalid(code: &mut CodeGenerator<'_>) {
+    ///     code.sxtl(V0.s4(), V1.b8()).unwrap();
+    /// }
+    /// ```
+    pub fn shrn<N: NarrowingSource>(
+        &mut self,
+        rd: N::Narrow,
+        rn: N,
+        shift: u8,
+    ) -> Result<(), String> {
         self.emit(inst::shrn_v(rd.index(), rn.index(), N::SIZE, shift))
     }
 
@@ -655,7 +931,13 @@ impl<'a> CodeGenerator<'a> {
 
     /// `EXT(Vd.8B|16B, Vn, Vm, #index)`
     pub fn ext<V: VRegBytes>(&mut self, rd: V, rn: V, rm: V, index: u8) -> Result<(), String> {
-        self.emit(inst::ext_v16b(rd.index(), rn.index(), rm.index(), index, V::Q))
+        self.emit(inst::ext_v16b(
+            rd.index(),
+            rn.index(),
+            rm.index(),
+            index,
+            V::Q,
+        ))
     }
 
     /// `MOVI(Vd.8B|16B, #imm8)`
@@ -811,6 +1093,29 @@ mod tests {
                 unsafe { p.read_unaligned() }
             })
             .collect()
+    }
+
+    #[test]
+    fn q_pair_offsets_match_clang_encodings() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        let mut code = CodeGenerator::new(&mut block);
+        code.stp_q(Q8, Q9, SP, 96).unwrap();
+        code.ldp_q(Q8, Q9, SP, 96).unwrap();
+        code.stp_q(Q0, Q31, X7, -1024).unwrap();
+        code.ldp_q(Q31, Q0, X7, 1008).unwrap();
+        assert_eq!(
+            words(&block),
+            [0xad03_27e8, 0xad43_27e8, 0xad20_7ce0, 0xad5f_80ff]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "out of imm7 range")]
+    fn q_pair_rejects_offset_past_signed_limit() {
+        let mut block = BlockOfCode::with_size(4096).unwrap();
+        CodeGenerator::new(&mut block)
+            .stp_q(Q0, Q1, SP, 1024)
+            .unwrap();
     }
 
     #[test]
